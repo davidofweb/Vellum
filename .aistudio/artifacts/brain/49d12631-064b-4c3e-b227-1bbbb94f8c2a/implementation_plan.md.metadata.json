@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan to load AgentRouter gateway catalog routes (such as /api/pricing, /api/models, and /api/available_model) whenever /v1/models returns 0 models, parse New API model_name and grouped channel dictionaries (including Group 1 models like gpt-6-astra, gpt-6.1-sol, and gpt-5.4-sol), and support GPT-6 Astra and Sol models across OpenAI Responses and Chat Completions streaming and live testing.",
+  "updatedAt":  "2026-10-27T20:56:13.589265529Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

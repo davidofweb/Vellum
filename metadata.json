@@ -1,0 +1,6 @@
+{
+  "name": "Vellum",
+  "description": "A calm, distraction-free workspace for live streaming agent conversations and tasks powered by AgentRouter.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
