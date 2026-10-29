@@ -1,5 +1,7 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import {
+  ArrowDown,
+  ArrowDownToLine,
   ArrowRight,
   Check,
   ChevronDown,
@@ -19,7 +21,9 @@ import {
   RefreshCw,
   RotateCcw,
   SlidersHorizontal,
+  Square,
   Sun,
+  Volume2,
 } from 'lucide-react';
 import {
   AgentRole,
@@ -35,6 +39,9 @@ import {
 import { BASE_API_PRESETS, BUILT_IN_ROLES, STARTER_PROMPTS } from './constants';
 import { extractArtifactsFromText } from './utils/artifacts';
 import {
+  AGENTROUTER_OPENAI_MODELS,
+  fetchCatalogFallbackModels,
+  isAgentRouterMainHost,
   sanitizeApiKey,
   sanitizeBaseUrlInput,
   sanitizeWafCookie,
@@ -47,6 +54,7 @@ import { CanvasDrawer } from './components/CanvasDrawer';
 import { Sidebar } from './components/Sidebar';
 import { Composer } from './components/Composer';
 import { KeyModelsModal } from './components/KeyModelsModal';
+import { isSpeechSynthesisSupported, prepareTextForSpeech } from './utils/speech';
 
 const STORAGE_CHATS_KEY = 'vellum_conversations_v2';
 const STORAGE_ROLES_KEY = 'vellum_custom_roles_v2';
@@ -55,6 +63,8 @@ const STORAGE_MODEL_KEY = 'vellum_selected_model_v2';
 const STORAGE_KEYS_LIST = 'vellum_user_keys_v2';
 const STORAGE_ACTIVE_KEY_ID = 'vellum_active_key_id_v2';
 const STORAGE_WORKSPACE_ID = 'vellum_workspace_id_v2';
+const STORAGE_FAST_REPLIES_KEY = 'vellum_fast_replies_v1';
+const STORAGE_STICKY_SCROLL_KEY = 'vellum_sticky_scroll_v1';
 
 function getOrCreateWorkspaceId(): string {
   try {
@@ -167,8 +177,29 @@ export default function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [activeArtifact, setActiveArtifact] = useState<ArtifactItem | null>(null);
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
+  const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
+  const [speechSupported] = useState<boolean>(() => isSpeechSynthesisSupported());
   const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
   const [inboxTasks, setInboxTasks] = useState<InboundAgentTask[]>([]);
+  const [fastReplies, setFastReplies] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_FAST_REPLIES_KEY);
+      if (saved !== null) return saved === 'true';
+    } catch {
+      // Ignore
+    }
+    return true;
+  });
+  const [stickyScroll, setStickyScroll] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_STICKY_SCROLL_KEY);
+      if (saved !== null) return saved === 'true';
+    } catch {
+      // Ignore
+    }
+    return true;
+  });
+  const [showJumpToBottom, setShowJumpToBottom] = useState(false);
 
   const [managerOpen, setManagerOpen] = useState(false);
   const [managerTab, setManagerTab] = useState<'models' | 'keys'>('models');
@@ -181,7 +212,30 @@ export default function App() {
   const [showInlineKey, setShowInlineKey] = useState(false);
 
   const abortControllerRef = useRef<AbortController | null>(null);
+  const speechSessionRef = useRef<number>(0);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const stickyScrollRef = useRef<boolean>(stickyScroll);
+  const userScrolledUpRef = useRef<boolean>(false);
+  const lastScrollTopRef = useRef<number>(0);
+  const programmaticScrollRef = useRef<boolean>(false);
+
+  const stopSpeaking = useCallback(() => {
+    speechSessionRef.current += 1;
+    if (isSpeechSynthesisSupported()) {
+      window.speechSynthesis.cancel();
+    }
+    setSpeakingMsgId(null);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      speechSessionRef.current += 1;
+      if (isSpeechSynthesisSupported()) {
+        window.speechSynthesis.cancel();
+      }
+    };
+  }, []);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
@@ -210,12 +264,30 @@ export default function App() {
   }, [activeKeyObj?.id]);
 
   useEffect(() => {
+    if (isStreaming) return;
     try {
       localStorage.setItem(STORAGE_CHATS_KEY, JSON.stringify(conversations));
     } catch {
       // Ignore
     }
-  }, [conversations]);
+  }, [conversations, isStreaming]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_FAST_REPLIES_KEY, String(fastReplies));
+    } catch {
+      // Ignore
+    }
+  }, [fastReplies]);
+
+  useEffect(() => {
+    stickyScrollRef.current = stickyScroll;
+    try {
+      localStorage.setItem(STORAGE_STICKY_SCROLL_KEY, String(stickyScroll));
+    } catch {
+      // Ignore
+    }
+  }, [stickyScroll]);
 
   useEffect(() => {
     try {
@@ -256,11 +328,36 @@ export default function App() {
     setSyncError(null);
 
     try {
-      const data = await syncModelsFromGateway(
+      let data = await syncModelsFromGateway(
         keyItem.baseUrl,
         keyItem.apiKey,
         keyItem.wafCookie
       );
+
+      // When initial /v1/models returns 0 results, automatically fall back to /api/pricing or /api/available_models
+      if (data.models.length === 0) {
+        const fallbackData = await fetchCatalogFallbackModels(
+          keyItem.baseUrl,
+          keyItem.apiKey,
+          keyItem.wafCookie
+        );
+
+        if (fallbackData.models.length > 0) {
+          data = {
+            ...data,
+            models: fallbackData.models,
+            sourceUrl: fallbackData.sourceUrl || data.sourceUrl,
+            gatewayMessage: fallbackData.gatewayMessage || data.gatewayMessage,
+          };
+        } else if (isAgentRouterMainHost(keyItem.baseUrl)) {
+          data = {
+            ...data,
+            models: AGENTROUTER_OPENAI_MODELS.map((m) => ({ ...m })),
+            sourceUrl: data.sourceUrl || sanitizeBaseUrlInput(keyItem.baseUrl),
+          };
+        }
+      }
+
       setSyncedSourceUrl(data.sourceUrl);
 
       if (data.verifiedResults) {
@@ -297,7 +394,7 @@ export default function App() {
         setSyncError(
           gwMsg
             ? `Gateway notice (${hostLabel}): ${gwMsg}`
-            : `Connected to ${hostLabel}, but 0 models were listed on /v1/models. Add your model IDs in API & Models.`
+            : `Connected to ${hostLabel}, but 0 models were returned from /v1/models, /api/pricing, or /api/available_models. Add your model IDs in API & Models.`
         );
       } else {
         setSelectedModel((prev) =>
@@ -305,6 +402,36 @@ export default function App() {
         );
       }
     } catch (err: unknown) {
+      const errMessage = err instanceof Error ? err.message : 'Unable to sync models.';
+      const isAuthFailure = /invalid api key|incorrect api key|unauthorized|401|enter your/i.test(
+        errMessage
+      );
+
+      if (!isAuthFailure) {
+        const fallbackData = await fetchCatalogFallbackModels(
+          keyItem.baseUrl,
+          keyItem.apiKey,
+          keyItem.wafCookie
+        );
+        if (fallbackData.models.length > 0) {
+          const seen = new Set<string>();
+          const mergedModels: ModelOption[] = [];
+          for (const m of [...fallbackData.models, ...buildCustomOptions(keyItem.customModels)]) {
+            if (!seen.has(m.id)) {
+              seen.add(m.id);
+              mergedModels.push(m);
+            }
+          }
+          setSyncedSourceUrl(fallbackData.sourceUrl || sanitizeBaseUrlInput(keyItem.baseUrl));
+          setModels(mergedModels);
+          setSelectedModel((prev) =>
+            mergedModels.some((m) => m.id === prev) ? prev : mergedModels[0].id
+          );
+          setSyncError(null);
+          return;
+        }
+      }
+
       const fallbackCustom = buildCustomOptions(keyItem.customModels);
       setModels(fallbackCustom);
       if (fallbackCustom.length > 0) {
@@ -315,7 +442,7 @@ export default function App() {
         setSelectedModel('');
       }
       setSyncedSourceUrl(null);
-      setSyncError(err instanceof Error ? err.message : 'Unable to sync models.');
+      setSyncError(errMessage);
     } finally {
       setIsSyncingModels(false);
     }
@@ -580,8 +707,83 @@ export default function App() {
   };
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    userScrolledUpRef.current = false;
+    setShowJumpToBottom(false);
+    const el = scrollContainerRef.current;
+    if (el) {
+      programmaticScrollRef.current = true;
+      el.scrollTo({ top: el.scrollHeight, behavior });
+      lastScrollTopRef.current = el.scrollHeight;
+      window.setTimeout(() => {
+        programmaticScrollRef.current = false;
+      }, behavior === 'smooth' ? 320 : 50);
+      return;
+    }
     messagesEndRef.current?.scrollIntoView({ behavior, block: 'end' });
   }, []);
+
+  const handleStageScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const currentScrollTop = el.scrollTop;
+    const distanceFromBottom = el.scrollHeight - currentScrollTop - el.clientHeight;
+    const hasMessages = Boolean(activeConversation?.messages.length);
+
+    setShowJumpToBottom(hasMessages && distanceFromBottom > 120);
+
+    if (!programmaticScrollRef.current) {
+      if (currentScrollTop < lastScrollTopRef.current - 6 && distanceFromBottom > 48) {
+        userScrolledUpRef.current = true;
+      } else if (distanceFromBottom <= 48) {
+        userScrolledUpRef.current = false;
+      }
+    }
+
+    lastScrollTopRef.current = currentScrollTop;
+  }, [activeConversation?.messages.length]);
+
+  const handleToggleStickyScroll = useCallback(() => {
+    setStickyScroll((prev) => {
+      const next = !prev;
+      stickyScrollRef.current = next;
+      if (next) {
+        userScrolledUpRef.current = false;
+        if (isStreaming) {
+          requestAnimationFrame(() => scrollToBottom('smooth'));
+        }
+      }
+      return next;
+    });
+  }, [isStreaming, scrollToBottom]);
+
+  useEffect(() => {
+    userScrolledUpRef.current = false;
+    requestAnimationFrame(() => {
+      const el = scrollContainerRef.current;
+      if (!el) return;
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+      setShowJumpToBottom(Boolean(activeConversation?.messages.length) && distanceFromBottom > 120);
+    });
+  }, [activeId, activeConversation?.messages.length]);
+
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+
+    if (isStreaming && stickyScroll && !userScrolledUpRef.current) {
+      programmaticScrollRef.current = true;
+      el.scrollTop = el.scrollHeight;
+      lastScrollTopRef.current = el.scrollTop;
+      setShowJumpToBottom(false);
+      const frame = requestAnimationFrame(() => {
+        programmaticScrollRef.current = false;
+      });
+      return () => cancelAnimationFrame(frame);
+    }
+
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setShowJumpToBottom(Boolean(activeConversation?.messages.length) && distanceFromBottom > 120);
+  }, [activeConversation?.messages, isStreaming, stickyScroll]);
 
   const streamAgentResponse = useCallback(
     async (
@@ -610,6 +812,7 @@ export default function App() {
       };
 
       setIsStreaming(true);
+      userScrolledUpRef.current = false;
 
       setConversations((prev) =>
         prev.map((c) =>
@@ -623,7 +826,9 @@ export default function App() {
         )
       );
 
-      requestAnimationFrame(() => scrollToBottom('smooth'));
+      if (stickyScrollRef.current) {
+        requestAnimationFrame(() => scrollToBottom('smooth'));
+      }
 
       const payloadMessages = historyMessages.map((m) => {
         let fullText = m.content;
@@ -639,31 +844,42 @@ export default function App() {
         };
       });
 
+      let rafId: number | null = null;
+      let accumulatedContent = '';
+      let accumulatedThinking = '';
+
+      const commitStreamState = (done = false) => {
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === convId
+              ? {
+                  ...c,
+                  messages: c.messages.map((m) =>
+                    m.id === assistantMsgId
+                      ? {
+                          ...m,
+                          content: accumulatedContent,
+                          thinking: accumulatedThinking,
+                          ...(done ? { isStreaming: false } : {}),
+                        }
+                      : m
+                  ),
+                  ...(done ? { updatedAt: Date.now() } : {}),
+                }
+              : c
+          )
+        );
+      };
+
+      const scheduleStreamFlush = () => {
+        if (rafId !== null) return;
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          commitStreamState(false);
+        });
+      };
+
       try {
-        let accumulatedContent = '';
-        let accumulatedThinking = '';
-
-        const flushStreamState = () => {
-          setConversations((prev) =>
-            prev.map((c) =>
-              c.id === convId
-                ? {
-                    ...c,
-                    messages: c.messages.map((m) =>
-                      m.id === assistantMsgId
-                        ? {
-                            ...m,
-                            content: accumulatedContent,
-                            thinking: accumulatedThinking,
-                          }
-                        : m
-                    ),
-                  }
-                : c
-            )
-          );
-        };
-
         await streamChatFromGateway({
           baseUrl: userKey.baseUrl,
           rawApiKey: userKey.apiKey,
@@ -672,30 +888,23 @@ export default function App() {
           messages: payloadMessages,
           systemPrompt: roleToUse.instructions,
           temperature: roleToUse.temperature,
+          reasoningEffort: fastReplies ? 'low' : 'medium',
           signal: controller.signal,
           onContent: (delta) => {
             accumulatedContent += delta;
-            flushStreamState();
+            scheduleStreamFlush();
           },
           onThinking: (delta) => {
             accumulatedThinking += delta;
-            flushStreamState();
+            scheduleStreamFlush();
           },
         });
 
-        setConversations((prev) =>
-          prev.map((c) =>
-            c.id === convId
-              ? {
-                  ...c,
-                  messages: c.messages.map((m) =>
-                    m.id === assistantMsgId ? { ...m, isStreaming: false } : m
-                  ),
-                  updatedAt: Date.now(),
-                }
-              : c
-          )
-        );
+        if (rafId !== null) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+        commitStreamState(true);
 
         const extracted = extractArtifactsFromText(assistantMsgId, accumulatedContent);
         const firstPreviewable = extracted.find((a) => a.previewable);
@@ -703,19 +912,12 @@ export default function App() {
           setActiveArtifact(firstPreviewable);
         }
       } catch (err: unknown) {
+        if (rafId !== null) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
         if (controller.signal.aborted) {
-          setConversations((prev) =>
-            prev.map((c) =>
-              c.id === convId
-                ? {
-                    ...c,
-                    messages: c.messages.map((m) =>
-                      m.id === assistantMsgId ? { ...m, isStreaming: false } : m
-                    ),
-                  }
-                : c
-            )
-          );
+          commitStreamState(true);
         } else {
           const message = err instanceof Error ? err.message : 'Something went wrong.';
           setConversations((prev) =>
@@ -738,7 +940,7 @@ export default function App() {
         abortControllerRef.current = null;
       }
     },
-    [scrollToBottom]
+    [scrollToBottom, fastReplies]
   );
 
   const handleSend = useCallback(
@@ -820,6 +1022,7 @@ export default function App() {
   };
 
   const handleNewChat = () => {
+    stopSpeaking();
     if (isStreaming) abortControllerRef.current?.abort();
     const blank = createBlankConversation(selectedModel, selectedRoleId);
     setConversations((prev) => [blank, ...prev]);
@@ -830,6 +1033,9 @@ export default function App() {
   };
 
   const handleDeleteConversation = (id: string) => {
+    if (id === activeConversation?.id) {
+      stopSpeaking();
+    }
     setConversations((prev) => {
       const remaining = prev.filter((c) => c.id !== id);
       if (remaining.length === 0) {
@@ -846,6 +1052,7 @@ export default function App() {
 
   const handleRetryMessage = (assistantMsgIndex: number) => {
     if (isStreaming || !activeConversation || !activeKeyObj || !selectedModel) return;
+    stopSpeaking();
     const historyBefore = activeConversation.messages.slice(0, assistantMsgIndex);
     if (historyBefore.length === 0) return;
     streamAgentResponse(
@@ -876,6 +1083,53 @@ export default function App() {
     await navigator.clipboard.writeText(msg.content);
     setCopiedMsgId(msg.id);
     setTimeout(() => setCopiedMsgId(null), 1800);
+  };
+
+  const handleToggleSpeakMessage = (msg: ChatMessage) => {
+    if (!isSpeechSynthesisSupported()) return;
+
+    if (speakingMsgId === msg.id) {
+      stopSpeaking();
+      return;
+    }
+
+    speechSessionRef.current += 1;
+    const sessionId = speechSessionRef.current;
+    window.speechSynthesis.cancel();
+
+    const chunks = prepareTextForSpeech(msg.content);
+    if (chunks.length === 0) {
+      setSpeakingMsgId(null);
+      return;
+    }
+
+    setSpeakingMsgId(msg.id);
+
+    const speakChunkAt = (idx: number) => {
+      if (speechSessionRef.current !== sessionId) return;
+      if (idx >= chunks.length) {
+        setSpeakingMsgId((curr) => (curr === msg.id ? null : curr));
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(chunks[idx]);
+      utterance.rate = 1;
+      utterance.pitch = 1;
+
+      utterance.onend = () => {
+        if (speechSessionRef.current !== sessionId) return;
+        speakChunkAt(idx + 1);
+      };
+
+      utterance.onerror = () => {
+        if (speechSessionRef.current !== sessionId) return;
+        setSpeakingMsgId((curr) => (curr === msg.id ? null : curr));
+      };
+
+      window.speechSynthesis.speak(utterance);
+    };
+
+    speakChunkAt(0);
   };
 
   const handleOpenInboxTaskInChat = (task: InboundAgentTask) => {
@@ -913,7 +1167,7 @@ export default function App() {
 
   const handleSendSampleInboundRequest = async (promptText: string) => {
     if (!activeKeyObj || !selectedModel) return;
-    await fetch(`/api/inbox?workspaceId=${encodeURIComponent(workspaceId)}`, {
+    const res = await fetch(`/api/inbox?workspaceId=${encodeURIComponent(workspaceId)}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -933,19 +1187,37 @@ export default function App() {
         autoRun: true,
       }),
     });
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      if (data?.task) {
+        const returnedTask: InboundAgentTask = data.task;
+        setInboxTasks((prev) => [
+          returnedTask,
+          ...prev.filter((t) => t.id !== returnedTask.id),
+        ]);
+      }
+    }
   };
 
   const handleDeleteInboxTask = async (id: string) => {
+    setInboxTasks((prev) => prev.filter((t) => t.id !== id));
     await fetch(`/api/inbox/${id}?workspaceId=${encodeURIComponent(workspaceId)}`, {
       method: 'DELETE',
     });
   };
 
-  const allConversationArtifacts = activeConversation
-    ? activeConversation.messages.flatMap((m) =>
-        m.role === 'assistant' ? extractArtifactsFromText(m.id, m.content) : []
-      )
-    : [];
+  const handleOpenArtifact = useCallback((art: ArtifactItem) => {
+    setActiveArtifact(art);
+  }, []);
+
+  const allConversationArtifacts = useMemo(() => {
+    if (!activeConversation) return [];
+    return activeConversation.messages.flatMap((m) =>
+      m.role === 'assistant' && !m.isStreaming
+        ? extractArtifactsFromText(m.id, m.content)
+        : []
+    );
+  }, [activeConversation]);
 
   const activeModelDisplay =
     models.find((m) => m.id === selectedModel)?.label || selectedModel;
@@ -962,6 +1234,7 @@ export default function App() {
         conversations={conversations}
         activeId={activeConversation?.id || ''}
         onSelectConversation={(id) => {
+          stopSpeaking();
           setActiveId(id);
           setActiveArtifact(null);
         }}
@@ -988,6 +1261,8 @@ export default function App() {
         onSendSampleInboundRequest={handleSendSampleInboundRequest}
         darkMode={darkMode}
         onToggleDarkMode={() => setDarkMode((d) => !d)}
+        stickyScroll={stickyScroll}
+        onToggleStickyScroll={handleToggleStickyScroll}
         selectedModel={selectedModel}
       />
 
@@ -1064,6 +1339,32 @@ export default function App() {
 
             <button
               type="button"
+              onClick={handleToggleStickyScroll}
+              aria-pressed={stickyScroll}
+              aria-label={
+                stickyScroll
+                  ? 'Sticky Scroll is on. Tap to disable auto-scrolling.'
+                  : 'Sticky Scroll is off. Tap to enable auto-scrolling.'
+              }
+              title={
+                stickyScroll
+                  ? 'Sticky Scroll: On — auto-scrolls with replies'
+                  : 'Sticky Scroll: Off — stays put while reading'
+              }
+              className={`min-h-[40px] min-w-[40px] md:px-3.5 rounded-full border text-xs font-mono font-medium flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+                stickyScroll
+                  ? 'border-foreground/30 bg-foreground/[0.07] text-foreground'
+                  : 'border-foreground/15 text-muted-foreground hover:text-foreground hover:bg-foreground/5'
+              }`}
+            >
+              <ArrowDownToLine className="w-3.5 h-3.5 shrink-0" />
+              <span className="hidden md:inline">
+                Sticky {stickyScroll ? 'On' : 'Off'}
+              </span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => setDarkMode((d) => !d)}
               aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
               title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
@@ -1085,7 +1386,10 @@ export default function App() {
         </header>
 
         {/* Scrollable Stage */}
+        <div className="relative flex-1 min-h-0 flex flex-col">
         <div
+          ref={scrollContainerRef}
+          onScroll={handleStageScroll}
           className={`flex-1 overflow-y-auto px-4 sm:px-8 ${
             !activeKeyObj || !activeConversation || activeConversation.messages.length === 0
               ? 'optimus-grid'
@@ -1337,9 +1641,10 @@ export default function App() {
             <div className="max-w-3xl mx-auto py-6 sm:py-10 space-y-9">
               {activeConversation.messages.map((msg, index) => {
                 const isUser = msg.role === 'user';
-                const msgArtifacts = !isUser
-                  ? extractArtifactsFromText(msg.id, msg.content)
-                  : [];
+                const msgArtifacts =
+                  !isUser && !msg.isStreaming
+                    ? extractArtifactsFromText(msg.id, msg.content)
+                    : [];
                 const thinkingOpen = Boolean(expandedThinking[msg.id]);
 
                 if (isUser) {
@@ -1397,7 +1702,7 @@ export default function App() {
                       <MarkdownRenderer
                         content={msg.content}
                         messageId={msg.id}
-                        onOpenArtifact={(art) => setActiveArtifact(art)}
+                        onOpenArtifact={handleOpenArtifact}
                       />
                     ) : msg.isStreaming && !msg.thinking ? (
                       <div className="py-2 font-mono text-xs text-muted-foreground">
@@ -1450,12 +1755,42 @@ export default function App() {
                           )}
                         </div>
 
-                        <div className="flex items-center gap-1">
+                        <div className="flex flex-wrap items-center gap-1">
+                          {speechSupported && msg.content.trim() && (
+                            <button
+                              type="button"
+                              onClick={() => handleToggleSpeakMessage(msg)}
+                              aria-label={
+                                speakingMsgId === msg.id
+                                  ? 'Stop reading response aloud'
+                                  : 'Read response aloud'
+                              }
+                              aria-pressed={speakingMsgId === msg.id}
+                              className={`min-h-[40px] px-3 rounded-full font-mono text-xs font-medium flex items-center gap-1.5 transition-colors ${
+                                speakingMsgId === msg.id
+                                  ? 'bg-foreground text-background'
+                                  : 'text-muted-foreground hover:text-foreground hover:bg-foreground/5'
+                              }`}
+                            >
+                              {speakingMsgId === msg.id ? (
+                                <>
+                                  <Square className="w-3 h-3 fill-current" />
+                                  <span>Stop</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Volume2 className="w-3.5 h-3.5" />
+                                  <span>Read</span>
+                                </>
+                              )}
+                            </button>
+                          )}
+
                           {msg.content && (
                             <button
                               type="button"
                               onClick={() => handleCopyMessage(msg)}
-                              className="min-h-[38px] px-3 rounded-full font-mono text-xs text-muted-foreground hover:text-foreground hover:bg-foreground/5 flex items-center gap-1.5 transition-colors"
+                              className="min-h-[40px] px-3 rounded-full font-mono text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-foreground/5 flex items-center gap-1.5 transition-colors"
                             >
                               {copiedMsgId === msg.id ? (
                                 <Check className="w-3.5 h-3.5 text-foreground" />
@@ -1469,7 +1804,7 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => handleRetryMessage(index)}
-                            className="min-h-[38px] px-3 rounded-full font-mono text-xs text-muted-foreground hover:text-foreground hover:bg-foreground/5 flex items-center gap-1.5 transition-colors"
+                            className="min-h-[40px] px-3 rounded-full font-mono text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-foreground/5 flex items-center gap-1.5 transition-colors"
                           >
                             <RotateCcw className="w-3.5 h-3.5" />
                             <span>Retry</span>
@@ -1478,7 +1813,7 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => handleBranchFromMessage(index)}
-                            className="min-h-[38px] px-3 rounded-full font-mono text-xs text-muted-foreground hover:text-foreground hover:bg-foreground/5 flex items-center gap-1.5 transition-colors"
+                            className="min-h-[40px] px-3 rounded-full font-mono text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-foreground/5 flex items-center gap-1.5 transition-colors"
                           >
                             <GitBranch className="w-3.5 h-3.5" />
                             <span>Branch</span>
@@ -1492,6 +1827,21 @@ export default function App() {
               <div ref={messagesEndRef} className="h-4" />
             </div>
           )}
+        </div>
+
+        {showJumpToBottom && activeKeyObj && Boolean(activeConversation?.messages.length) && (
+          <div className="pointer-events-none absolute bottom-3 left-0 right-0 flex justify-center px-4 z-10">
+            <button
+              type="button"
+              onClick={() => scrollToBottom('smooth')}
+              aria-label="Jump to bottom of chat"
+              className="pointer-events-auto min-h-[40px] px-4 rounded-full bg-background/95 backdrop-blur-md border border-foreground/20 hover:border-foreground/40 shadow-sm text-xs font-semibold tracking-tight text-foreground flex items-center gap-1.5 transition-colors"
+            >
+              <ArrowDown className="w-3.5 h-3.5 shrink-0" />
+              <span>{isStreaming ? 'Reply streaming below' : 'Jump to bottom'}</span>
+            </button>
+          </div>
+        )}
         </div>
 
         {/* Ergonomic Bottom Thumb-Zone Composer */}
@@ -1516,6 +1866,8 @@ export default function App() {
           roles={allRoles}
           selectedRole={selectedRole}
           onSelectRole={(roleId) => setSelectedRoleId(roleId)}
+          fastReplies={fastReplies}
+          onToggleFastReplies={() => setFastReplies((v) => !v)}
         />
       </main>
 

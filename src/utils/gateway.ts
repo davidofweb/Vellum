@@ -50,7 +50,8 @@ export function sanitizeBaseUrlInput(raw: string): string {
     .replace(/\/messages$/i, '')
     .replace(/\/v1\/models$/i, '/v1')
     .replace(/\/models$/i, '')
-    .replace(/\/api\/pricing$/i, '')
+    .replace(/\/api\/pricing(_new)?$/i, '')
+    .replace(/\/api\/available_models?$/i, '')
     .replace(/\/+$/, '');
   return cleaned;
 }
@@ -144,18 +145,7 @@ export function normalizeBaseUrlCandidates(raw: string): {
     originHost = originRoot;
   }
 
-  const catalogUrls: string[] = [];
-  const host = getHostname(cleaned);
-  const skipWebCatalog =
-    host === 'agentrouter.org' ||
-    host === 'www.agentrouter.org' ||
-    host === 'co.agentrouter.org' ||
-    host === 'api.openai.com';
-
-  if (!skipWebCatalog && originHost) {
-    pushUnique(catalogUrls, `${originHost}/api/pricing`);
-    pushUnique(catalogUrls, `${originHost}/api/models`);
-  }
+  const catalogUrls = buildCatalogFallbackUrls(cleaned);
 
   const responsesUrls: string[] = [];
   for (const base of v1Urls) {
@@ -168,6 +158,40 @@ export function normalizeBaseUrlCandidates(raw: string): {
   }
 
   return { v1Urls, catalogUrls, responsesUrls, anthropicMessageUrls };
+}
+
+export function buildCatalogFallbackUrls(rawBaseUrl: string): string[] {
+  const cleaned = sanitizeBaseUrlInput(rawBaseUrl);
+  if (!cleaned) return [];
+
+  const host = getHostname(cleaned);
+  if (host === 'api.openai.com' || host === 'co.agentrouter.org') {
+    return [];
+  }
+
+  const pushUnique = (list: string[], url: string) => {
+    if (url && !list.includes(url)) list.push(url);
+  };
+
+  const baseWithoutV1 = cleaned.replace(/\/v1$/i, '');
+  let originHost = '';
+  try {
+    originHost = new URL(cleaned).origin;
+  } catch {
+    originHost = baseWithoutV1;
+  }
+
+  const roots: string[] = [];
+  pushUnique(roots, baseWithoutV1);
+  pushUnique(roots, originHost);
+
+  const urls: string[] = [];
+  for (const root of roots) {
+    pushUnique(urls, `${root}/api/pricing`);
+    pushUnique(urls, `${root}/api/available_models`);
+    pushUnique(urls, `${root}/api/available_model`);
+  }
+  return urls;
 }
 
 export function parseGatewayErrorText(
@@ -301,10 +325,54 @@ export function extractModelsFromPayload(payload: unknown): {
   const obj = (payload && typeof payload === 'object' ? payload : {}) as Record<string, any>;
   let rawList: unknown[] = [];
 
+  const reservedKeys = new Set([
+    'object',
+    'total',
+    'page',
+    'limit',
+    'has_more',
+    'code',
+    'msg',
+    'message',
+    'success',
+    'status',
+    'group_ratio',
+    'usable_group',
+    'auto_groups',
+    'vendors',
+    'supported_endpoint',
+  ]);
+
+  const appendObjectMapEntries = (mapObj: Record<string, any>) => {
+    const entries = Object.entries(mapObj).filter(([k]) => !reservedKeys.has(k));
+    for (const [key, val] of entries) {
+      if (Array.isArray(val)) {
+        for (const sub of val) {
+          rawList.push(sub);
+        }
+      } else if (val && typeof val === 'object') {
+        const valObj = val as Record<string, unknown>;
+        const existingStrId =
+          typeof valObj.id === 'string' && valObj.id.trim() && !/^\d+$/.test(valObj.id.trim())
+            ? valObj.id.trim()
+            : key;
+        rawList.push({ ...valObj, id: existingStrId });
+      } else if (typeof val === 'string' && !/^\d+$/.test(key)) {
+        rawList.push(key);
+      } else if (val === true && !/^\d+$/.test(key)) {
+        rawList.push(key);
+      }
+    }
+  };
+
   if (Array.isArray(payload)) {
     rawList = payload;
   } else if (Array.isArray(obj.data)) {
     rawList = obj.data;
+  } else if (Array.isArray(obj.available_models)) {
+    rawList = obj.available_models;
+  } else if (Array.isArray(obj.availableModels)) {
+    rawList = obj.availableModels;
   } else if (Array.isArray(obj.models)) {
     rawList = obj.models;
   } else if (Array.isArray(obj.pricing)) {
@@ -315,10 +383,20 @@ export function extractModelsFromPayload(payload: unknown): {
     rawList = obj.result;
   } else if (obj.catalog && typeof obj.catalog === 'object' && Array.isArray(obj.catalog.models)) {
     rawList = obj.catalog.models;
+  } else if (obj.pricing && typeof obj.pricing === 'object') {
+    appendObjectMapEntries(obj.pricing as Record<string, any>);
+  } else if (obj.available_models && typeof obj.available_models === 'object') {
+    appendObjectMapEntries(obj.available_models as Record<string, any>);
+  } else if (obj.availableModels && typeof obj.availableModels === 'object') {
+    appendObjectMapEntries(obj.availableModels as Record<string, any>);
   } else if (obj.data && typeof obj.data === 'object') {
     const nested = obj.data as Record<string, any>;
     if (Array.isArray(nested.data)) {
       rawList = nested.data;
+    } else if (Array.isArray(nested.available_models)) {
+      rawList = nested.available_models;
+    } else if (Array.isArray(nested.availableModels)) {
+      rawList = nested.availableModels;
     } else if (Array.isArray(nested.models)) {
       rawList = nested.models;
     } else if (Array.isArray(nested.pricing)) {
@@ -328,36 +406,10 @@ export function extractModelsFromPayload(payload: unknown): {
     } else if (Array.isArray(nested.list)) {
       rawList = nested.list;
     } else {
-      const reservedKeys = new Set([
-        'object',
-        'total',
-        'page',
-        'limit',
-        'has_more',
-        'code',
-        'msg',
-        'message',
-        'group_ratio',
-        'usable_group',
-        'auto_groups',
-        'vendors',
-        'supported_endpoint',
-      ]);
-      const entries = Object.entries(nested).filter(([k]) => !reservedKeys.has(k));
-      for (const [key, val] of entries) {
-        if (Array.isArray(val)) {
-          for (const sub of val) {
-            rawList.push(sub);
-          }
-        } else if (val && typeof val === 'object') {
-          rawList.push({ id: key, ...(val as Record<string, unknown>) });
-        } else if (typeof val === 'string' && !/^\d+$/.test(key)) {
-          rawList.push(key);
-        } else if (val === true && !/^\d+$/.test(key)) {
-          rawList.push(key);
-        }
-      }
+      appendObjectMapEntries(nested);
     }
+  } else if (payload && typeof payload === 'object') {
+    appendObjectMapEntries(obj);
   }
 
   const seen = new Set<string>();
@@ -375,25 +427,36 @@ export function extractModelsFromPayload(payload: unknown): {
 
     if (!entry || typeof entry !== 'object') continue;
     const item = entry as Record<string, any>;
-    const id = String(
-      item.id ||
-        item.model_name ||
-        item.model ||
-        item.model_id ||
-        item.slug ||
-        item.key ||
-        item.name ||
-        item.value ||
-        ''
-    ).trim();
-    if (!id || /^\d+$/.test(id) || seen.has(id)) continue;
+    const candidateIds = [
+      item.model_name,
+      item.model_id,
+      item.model,
+      item.id,
+      item.slug,
+      item.key,
+      item.name,
+      item.value,
+    ];
+    let id = '';
+    for (const candidate of candidateIds) {
+      if (candidate === undefined || candidate === null) continue;
+      const trimmed = String(candidate).trim();
+      if (trimmed && !/^\d+$/.test(trimmed)) {
+        id = trimmed;
+        break;
+      }
+    }
+    if (!id || seen.has(id)) continue;
     seen.add(id);
 
     const rawOwner = String(
       item.owned_by || item.provider || item.vendor || item.owner_by || ''
     ).trim();
     const ownedBy = inferModelOwner(id, rawOwner);
-    const label = String(item.display_name || item.label || item.model_name || item.name || id).trim();
+    const rawLabel = String(
+      item.display_name || item.label || item.model_name || item.name || id
+    ).trim();
+    const label = rawLabel && !/^\d+$/.test(rawLabel) ? rawLabel : id;
     const contextWindow =
       typeof item.contextWindow === 'number'
         ? item.contextWindow
@@ -418,7 +481,9 @@ export function extractModelsFromPayload(payload: unknown): {
   return { models: syncedModels, gatewayMessage };
 }
 
-function isReasoningStyleModel(model: string): boolean {
+export type ReasoningEffortMode = 'low' | 'medium';
+
+export function isReasoningStyleModel(model: string): boolean {
   return /codex|gpt-[56]|\bsol\b|-sol\b|_sol\b|\bastra\b|-astra\b|_astra\b|\bluna\b|-luna\b|\bterra\b|-terra\b|^o[134]\b|\/o[134]\b|-o[134]\b/i.test(
     model
   );
@@ -432,13 +497,147 @@ function isFirewallErrorString(msg: string): boolean {
   return /firewall|slider|aliyun_waf/i.test(msg);
 }
 
+function isEndpointMismatchError(status: number, message: string): boolean {
+  if (status === 404 || status === 405) return true;
+  if (status === 400 || status === 422) {
+    return /responses|endpoint|messages|wire_api|not supported on this|only supported in|v1\/responses|v1\/messages/i.test(
+      message
+    );
+  }
+  return false;
+}
+
+function isReasoningParamRejectedError(status: number, message: string): boolean {
+  if (status !== 400 && status !== 422) return false;
+  return /reasoning_effort|reasoning\.effort|\breasoning\b|unknown parameter|unrecognized request argument|extra_forbidden|additional properties/i.test(
+    message
+  );
+}
+
+interface CachedBrowserRoute {
+  transport: 'direct' | 'proxy';
+  protocol?: BrowserWireProtocol;
+  endpointUrl?: string;
+}
+
+const browserRouteCache = new Map<string, CachedBrowserRoute>();
+const unsupportedReasoningParamCache = new Set<string>();
+
 /**
- * Syncs OpenAI models cleanly without firing multi-request bursts that trip edge firewalls:
- * 1. Single direct browser GET `/v1/models` on the configured Base API URL.
- * 2. For `agentrouter.org`, when `/v1/models` returns `[]` or scanner-blocks `/v1/models`,
- *    quietly checks `co.agentrouter.org/v1/models` once and resolves AgentRouter's OpenAI
- *    Group 1 models (`gpt-6.1-sol`, `gpt-6-astra`, `gpt-5.4-sol`, etc.) with zero request storms.
- * 3. For other gateways, gently checks `/api/pricing` and `/api/models` or the backend proxy.
+ * Attempts to fetch and parse model lists from `/api/pricing` or `/api/available_models`
+ * on the user's Base API URL when `/v1/models` returns 0 results.
+ */
+export async function fetchCatalogFallbackModels(
+  baseUrl: string,
+  rawApiKey: string,
+  rawWafCookie?: string
+): Promise<GatewaySyncResponse> {
+  const apiKey = sanitizeApiKey(rawApiKey);
+  const cleanBase = sanitizeBaseUrlInput(baseUrl);
+  const wafCookie = sanitizeWafCookie(rawWafCookie);
+  const { v1Urls } = normalizeBaseUrlCandidates(cleanBase);
+  const catalogUrls = buildCatalogFallbackUrls(cleanBase);
+
+  if (catalogUrls.length === 0) {
+    return { models: [], sourceUrl: v1Urls[0] || null };
+  }
+
+  const isMainAgentRouter = isAgentRouterMainHost(cleanBase);
+
+  // 1. Direct browser attempt on /api/pricing and /api/available_models (stops immediately if HTML firewall appears)
+  if (!wafCookie) {
+    let stopBrowserCatalog = false;
+
+    for (const catalogUrl of catalogUrls) {
+      if (stopBrowserCatalog) break;
+
+      const isPricingRoute = /\/api\/pricing$/i.test(catalogUrl);
+      const headerAttempts: Array<Record<string, string> | undefined> = isMainAgentRouter
+        ? [undefined]
+        : isPricingRoute
+          ? [undefined, { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' }]
+          : [{ Authorization: `Bearer ${apiKey}`, Accept: 'application/json' }, undefined];
+
+      for (const hdrs of headerAttempts) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 7000);
+        try {
+          const res = await fetch(catalogUrl, {
+            method: 'GET',
+            mode: 'cors',
+            credentials: 'omit',
+            ...(hdrs ? { headers: hdrs } : {}),
+            signal: controller.signal,
+          });
+          clearTimeout(timer);
+
+          const ct = res.headers.get('content-type') || '';
+          const rawText = await res.text().catch(() => '');
+
+          if (isHtmlFirewallOrPage(ct, rawText) && res.status !== 404) {
+            stopBrowserCatalog = true;
+            break;
+          }
+
+          if (!res.ok || !rawText) continue;
+
+          const parsed = JSON.parse(rawText);
+          if (extractGatewayErrorFromJson(parsed)) continue;
+
+          const { models, gatewayMessage } = extractModelsFromPayload(parsed);
+          if (models.length > 0) {
+            return {
+              models,
+              sourceUrl: v1Urls[0] || catalogUrl,
+              gatewayMessage,
+            };
+          }
+        } catch {
+          clearTimeout(timer);
+          if (isMainAgentRouter) {
+            stopBrowserCatalog = true;
+          }
+          // Network/CORS failure on this URL in browser — skip duplicate header attempt and let proxy try
+          break;
+        }
+      }
+    }
+  }
+
+  // 2. Backend proxy fallback (/api/models/catalog) for gateways without CORS on /api/pricing or /api/available_models
+  if (!isMainAgentRouter || Boolean(wafCookie)) {
+    try {
+      const res = await fetch('/api/models/catalog', {
+        headers: {
+          'x-agentrouter-key': apiKey,
+          'x-agentrouter-base-url': cleanBase,
+          ...(wafCookie ? { 'x-agentrouter-cookie': wafCookie } : {}),
+        },
+      });
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const proxyModels = Array.isArray(data.models) ? data.models : [];
+        if (proxyModels.length > 0) {
+          return {
+            models: proxyModels,
+            sourceUrl: typeof data.sourceUrl === 'string' ? data.sourceUrl : v1Urls[0] || null,
+            gatewayMessage:
+              typeof data.gatewayMessage === 'string' ? data.gatewayMessage : undefined,
+          };
+        }
+      }
+    } catch {
+      // Ignore proxy catalog errors so caller can continue cleanly
+    }
+  }
+
+  return { models: [], sourceUrl: v1Urls[0] || null };
+}
+
+/**
+ * Syncs models from the primary `/v1/models` endpoint on the user's Base API URL.
+ * When this returns 0 models, `syncModelsForKey` automatically falls back to
+ * `fetchCatalogFallbackModels` (`/api/pricing` and `/api/available_models`).
  */
 export async function syncModelsFromGateway(
   baseUrl: string,
@@ -448,7 +647,7 @@ export async function syncModelsFromGateway(
   const apiKey = sanitizeApiKey(rawApiKey);
   const cleanBase = sanitizeBaseUrlInput(baseUrl);
   const wafCookie = sanitizeWafCookie(rawWafCookie);
-  const { v1Urls, catalogUrls } = normalizeBaseUrlCandidates(cleanBase);
+  const { v1Urls } = normalizeBaseUrlCandidates(cleanBase);
 
   if (!v1Urls.length) {
     throw new Error('Enter your Base API URL first.');
@@ -567,10 +766,8 @@ export async function syncModelsFromGateway(
     throw new Error(definitiveAuthError);
   }
 
-  // AgentRouter handling: /v1/models on agentrouter.org either returns [] for Group 1 keys
-  // or triggers Aliyun's scanner rule on GET /v1/models. Never fire multi-endpoint bursts.
   if (isAgentRouterMainHost(cleanBase)) {
-    // Quietly check co.agentrouter.org/v1/models once in case the key belongs to that endpoint
+    // Check co.agentrouter.org/v1/models once in case the key belongs to that endpoint
     try {
       const coCtrl = new AbortController();
       const coTimer = setTimeout(() => coCtrl.abort(), 6000);
@@ -605,73 +802,35 @@ export async function syncModelsFromGateway(
       // Ignore co.agentrouter.org check errors
     }
 
+    // Return 0 models here so syncModelsForKey runs its /api/pricing & /api/available_models fallback next
     return {
-      models: AGENTROUTER_OPENAI_MODELS.map((m) => ({ ...m })),
+      models: [],
       sourceUrl: directConnectedBase || v1Urls[0],
       gatewayMessage: directGatewayNotice,
     };
   }
 
-  // Stage 2: Gentle secondary catalog check (only when Stage 1 did not hit an HTML firewall)
-  if (!directHitFirewall && catalogUrls.length > 0) {
-    for (const catalogUrl of catalogUrls) {
-      const isPublicPricing = /\/api\/pricing$/i.test(catalogUrl);
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 7000);
-      try {
-        const res = await fetch(catalogUrl, {
-          method: 'GET',
-          mode: 'cors',
-          credentials: 'omit',
-          ...(isPublicPricing
-            ? {}
-            : {
-                headers: {
-                  Authorization: `Bearer ${apiKey}`,
-                  Accept: 'application/json',
-                },
-              }),
-          signal: controller.signal,
-        });
-        clearTimeout(timer);
-
-        if (!res.ok) continue;
-        const ct = res.headers.get('content-type') || '';
-        const rawText = await res.text().catch(() => '');
-        if (!rawText || isHtmlFirewallOrPage(ct, rawText)) continue;
-
-        const parsed = JSON.parse(rawText);
-        if (extractGatewayErrorFromJson(parsed)) continue;
-
-        const { models, gatewayMessage } = extractModelsFromPayload(parsed);
-        if (models.length > 0) {
-          return {
-            models,
-            sourceUrl: directConnectedBase || v1Urls[0] || catalogUrl,
-            gatewayMessage,
-          };
-        }
-      } catch {
-        clearTimeout(timer);
+  // Backend proxy (/api/models) for /v1/models when browser had CORS/transport block
+  if (!directConnectedBase && !directHitFirewall) {
+    let proxyError: Error | null = null;
+    try {
+      const proxyResult = await callServerProxy();
+      if (proxyResult.models.length > 0) {
+        return proxyResult;
       }
+      if (proxyResult.sourceUrl) {
+        directConnectedBase = proxyResult.sourceUrl;
+      }
+      if (!directGatewayNotice && proxyResult.gatewayMessage) {
+        directGatewayNotice = proxyResult.gatewayMessage;
+      }
+    } catch (err: unknown) {
+      proxyError = err instanceof Error ? err : new Error(lastDirectError);
     }
-  }
 
-  // Stage 3: Backend proxy (/api/models) — never overwrite a valid browser connection with datacenter WAF
-  let proxyError: Error | null = null;
-  try {
-    const proxyResult = await callServerProxy();
-    if (proxyResult.models.length > 0) {
-      return proxyResult;
+    if (!directConnectedBase && proxyError && !isFirewallErrorString(proxyError.message)) {
+      throw proxyError;
     }
-    if (!directConnectedBase && proxyResult.sourceUrl) {
-      directConnectedBase = proxyResult.sourceUrl;
-    }
-    if (!directGatewayNotice && proxyResult.gatewayMessage) {
-      directGatewayNotice = proxyResult.gatewayMessage;
-    }
-  } catch (err: unknown) {
-    proxyError = err instanceof Error ? err : new Error(lastDirectError);
   }
 
   if (directConnectedBase) {
@@ -680,10 +839,6 @@ export async function syncModelsFromGateway(
       sourceUrl: directConnectedBase,
       gatewayMessage: directGatewayNotice,
     };
-  }
-
-  if (proxyError && !isFirewallErrorString(proxyError.message)) {
-    throw proxyError;
   }
 
   throw new Error(lastDirectError);
@@ -697,9 +852,10 @@ async function openDirectBrowserStream(params: {
   systemPrompt?: string;
   temperature?: number;
   maxTokens?: number;
+  reasoningEffort?: ReasoningEffortMode;
   signal: AbortSignal;
 }): Promise<
-  | { kind: 'ok'; response: Response; protocol: BrowserWireProtocol }
+  | { kind: 'ok'; response: Response; protocol: BrowserWireProtocol; endpointUrl: string }
   | { kind: 'api_error'; status: number; message: string }
   | { kind: 'firewall_error'; message: string }
   | { kind: 'transport_error'; message?: string }
@@ -712,12 +868,14 @@ async function openDirectBrowserStream(params: {
     systemPrompt,
     temperature,
     maxTokens,
+    reasoningEffort,
     signal,
   } = params;
 
   const { v1Urls, responsesUrls, anthropicMessageUrls } = normalizeBaseUrlCandidates(baseUrl);
   const reasoningModel = isReasoningStyleModel(model);
   const preferResponsesFirst = shouldPreferResponsesEndpoint(model);
+  const routeKey = `${baseUrl}::${model}`;
 
   const state: {
     hitFirewallMsg: string | null;
@@ -727,67 +885,98 @@ async function openDirectBrowserStream(params: {
     lastJsonError: null,
   };
 
-  const tryOpenAiChat = async (targetBases: string[]): Promise<Response | null> => {
-    const openAiMessages: ChatPayloadMessage[] = [];
-    if (systemPrompt && systemPrompt.trim()) {
-      openAiMessages.push({ role: 'system', content: systemPrompt.trim() });
-    }
-    for (const m of messages) {
-      openAiMessages.push({ role: m.role, content: String(m.content || '') });
-    }
+  const openAiMessages: ChatPayloadMessage[] = [];
+  if (systemPrompt && systemPrompt.trim()) {
+    openAiMessages.push({ role: 'system', content: systemPrompt.trim() });
+  }
+  for (const m of messages) {
+    openAiMessages.push({ role: m.role, content: String(m.content || '') });
+  }
 
-    for (const candidateBase of targetBases) {
-      try {
-        const res = await fetch(`${candidateBase}/chat/completions`, {
-          method: 'POST',
-          mode: 'cors',
-          credentials: 'omit',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'text/event-stream, application/json',
-            Authorization: `Bearer ${apiKey}`,
-            ...getBrowserSpoofHeadersForUrl(candidateBase),
-          },
-          body: JSON.stringify({
-            model,
-            messages: openAiMessages,
-            stream: true,
-            ...(typeof temperature === 'number' && !reasoningModel ? { temperature } : {}),
-            ...(typeof maxTokens === 'number'
-              ? reasoningModel
-                ? { max_completion_tokens: maxTokens }
-                : { max_tokens: maxTokens }
-              : {}),
-          }),
-          signal,
-        });
+  const tryOpenAiChatUrl = async (chatUrl: string): Promise<Response | null> => {
+    const canSendEffort =
+      reasoningModel &&
+      reasoningEffort === 'low' &&
+      !unsupportedReasoningParamCache.has(routeKey);
 
-        const ct = res.headers.get('content-type') || '';
-        if (res.ok && res.body) {
-          if (isHtmlFirewallOrPage(ct, '')) {
-            const htmlBody = await res.text().catch(() => '');
-            state.hitFirewallMsg = parseGatewayErrorText(htmlBody, res.status, ct, candidateBase);
-            return null;
-          }
-          return res;
-        }
+    const sendChatPost = async (includeEffort: boolean): Promise<Response> =>
+      fetch(chatUrl, {
+        method: 'POST',
+        mode: 'cors',
+        credentials: 'omit',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream, application/json',
+          Authorization: `Bearer ${apiKey}`,
+          ...getBrowserSpoofHeadersForUrl(chatUrl),
+        },
+        body: JSON.stringify({
+          model,
+          messages: openAiMessages,
+          stream: true,
+          ...(includeEffort ? { reasoning_effort: 'low' } : {}),
+          ...(typeof temperature === 'number' && !reasoningModel ? { temperature } : {}),
+          ...(typeof maxTokens === 'number'
+            ? reasoningModel
+              ? { max_completion_tokens: maxTokens }
+              : { max_tokens: maxTokens }
+            : {}),
+        }),
+        signal,
+      });
 
-        const errBody = await res.text().catch(() => '');
-        if (isHtmlFirewallOrPage(ct, errBody)) {
-          state.hitFirewallMsg = parseGatewayErrorText(errBody, res.status, ct, candidateBase);
+    try {
+      let res = await sendChatPost(canSendEffort);
+      let ct = res.headers.get('content-type') || '';
+
+      if (res.ok && res.body) {
+        if (isHtmlFirewallOrPage(ct, '')) {
+          const htmlBody = await res.text().catch(() => '');
+          state.hitFirewallMsg = parseGatewayErrorText(htmlBody, res.status, ct, chatUrl);
           return null;
         }
-
-        const parsedMsg = parseGatewayErrorText(errBody, res.status, ct, candidateBase);
-        state.lastJsonError = { status: res.status || 502, message: parsedMsg };
-      } catch (err: unknown) {
-        if (signal.aborted) throw err;
+        return res;
       }
+
+      let errBody = await res.text().catch(() => '');
+      if (isHtmlFirewallOrPage(ct, errBody)) {
+        state.hitFirewallMsg = parseGatewayErrorText(errBody, res.status, ct, chatUrl);
+        return null;
+      }
+
+      let parsedMsg = parseGatewayErrorText(errBody, res.status, ct, chatUrl);
+
+      if (canSendEffort && isReasoningParamRejectedError(res.status, parsedMsg)) {
+        unsupportedReasoningParamCache.add(routeKey);
+        res = await sendChatPost(false);
+        ct = res.headers.get('content-type') || '';
+        if (res.ok && res.body && !isHtmlFirewallOrPage(ct, '')) {
+          return res;
+        }
+        errBody = await res.text().catch(() => '');
+        parsedMsg = parseGatewayErrorText(errBody, res.status, ct, chatUrl);
+      }
+
+      state.lastJsonError = { status: res.status || 502, message: parsedMsg };
+    } catch (err: unknown) {
+      if (signal.aborted) throw err;
     }
     return null;
   };
 
-  const tryOpenAiResponses = async (targetRespUrls: string[]): Promise<Response | null> => {
+  const tryOpenAiChat = async (
+    targetBases: string[]
+  ): Promise<{ response: Response; endpointUrl: string } | null> => {
+    for (const candidateBase of targetBases) {
+      const chatUrl = `${candidateBase}/chat/completions`;
+      const res = await tryOpenAiChatUrl(chatUrl);
+      if (res) return { response: res, endpointUrl: chatUrl };
+      if (state.hitFirewallMsg) break;
+    }
+    return null;
+  };
+
+  const tryOpenAiResponsesUrl = async (respUrl: string): Promise<Response | null> => {
     const responsesInput = messages
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({
@@ -801,147 +990,251 @@ async function openDirectBrowserStream(params: {
         ],
       }));
 
-    for (const respUrl of targetRespUrls) {
-      try {
-        const res = await fetch(respUrl, {
-          method: 'POST',
-          mode: 'cors',
-          credentials: 'omit',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'text/event-stream, application/json',
-            Authorization: `Bearer ${apiKey}`,
-            ...getBrowserSpoofHeadersForUrl(respUrl),
-          },
-          body: JSON.stringify({
-            model,
-            ...(systemPrompt && systemPrompt.trim()
-              ? { instructions: systemPrompt.trim() }
-              : {}),
-            input: responsesInput,
-            stream: true,
-            ...(typeof temperature === 'number' && !reasoningModel ? { temperature } : {}),
-            ...(typeof maxTokens === 'number' ? { max_output_tokens: maxTokens } : {}),
-          }),
-          signal,
-        });
+    const canSendEffort =
+      reasoningModel &&
+      reasoningEffort === 'low' &&
+      !unsupportedReasoningParamCache.has(routeKey);
 
-        const ct = res.headers.get('content-type') || '';
-        if (res.ok && res.body) {
-          if (isHtmlFirewallOrPage(ct, '')) {
-            const htmlBody = await res.text().catch(() => '');
-            state.hitFirewallMsg = parseGatewayErrorText(htmlBody, res.status, ct, respUrl);
-            return null;
-          }
-          return res;
-        }
+    const sendRespPost = async (includeEffort: boolean): Promise<Response> =>
+      fetch(respUrl, {
+        method: 'POST',
+        mode: 'cors',
+        credentials: 'omit',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream, application/json',
+          Authorization: `Bearer ${apiKey}`,
+          ...getBrowserSpoofHeadersForUrl(respUrl),
+        },
+        body: JSON.stringify({
+          model,
+          ...(systemPrompt && systemPrompt.trim() ? { instructions: systemPrompt.trim() } : {}),
+          input: responsesInput,
+          stream: true,
+          ...(includeEffort ? { reasoning: { effort: 'low' } } : {}),
+          ...(typeof temperature === 'number' && !reasoningModel ? { temperature } : {}),
+          ...(typeof maxTokens === 'number' ? { max_output_tokens: maxTokens } : {}),
+        }),
+        signal,
+      });
 
-        const errBody = await res.text().catch(() => '');
-        if (isHtmlFirewallOrPage(ct, errBody)) {
-          state.hitFirewallMsg = parseGatewayErrorText(errBody, res.status, ct, respUrl);
+    try {
+      let res = await sendRespPost(canSendEffort);
+      let ct = res.headers.get('content-type') || '';
+
+      if (res.ok && res.body) {
+        if (isHtmlFirewallOrPage(ct, '')) {
+          const htmlBody = await res.text().catch(() => '');
+          state.hitFirewallMsg = parseGatewayErrorText(htmlBody, res.status, ct, respUrl);
           return null;
         }
-
-        const parsedMsg = parseGatewayErrorText(errBody, res.status, ct, respUrl);
-        if (!state.lastJsonError) {
-          state.lastJsonError = { status: res.status || 502, message: parsedMsg };
-        }
-      } catch (err: unknown) {
-        if (signal.aborted) throw err;
+        return res;
       }
+
+      let errBody = await res.text().catch(() => '');
+      if (isHtmlFirewallOrPage(ct, errBody)) {
+        state.hitFirewallMsg = parseGatewayErrorText(errBody, res.status, ct, respUrl);
+        return null;
+      }
+
+      let parsedMsg = parseGatewayErrorText(errBody, res.status, ct, respUrl);
+
+      if (canSendEffort && isReasoningParamRejectedError(res.status, parsedMsg)) {
+        unsupportedReasoningParamCache.add(routeKey);
+        res = await sendRespPost(false);
+        ct = res.headers.get('content-type') || '';
+        if (res.ok && res.body && !isHtmlFirewallOrPage(ct, '')) {
+          return res;
+        }
+        errBody = await res.text().catch(() => '');
+        parsedMsg = parseGatewayErrorText(errBody, res.status, ct, respUrl);
+      }
+
+      if (!state.lastJsonError) {
+        state.lastJsonError = { status: res.status || 502, message: parsedMsg };
+      }
+    } catch (err: unknown) {
+      if (signal.aborted) throw err;
     }
     return null;
   };
 
-  const tryAnthropicMessages = async (targetMsgUrls: string[]): Promise<Response | null> => {
+  const tryOpenAiResponses = async (
+    targetRespUrls: string[]
+  ): Promise<{ response: Response; endpointUrl: string } | null> => {
+    for (const respUrl of targetRespUrls) {
+      const res = await tryOpenAiResponsesUrl(respUrl);
+      if (res) return { response: res, endpointUrl: respUrl };
+      if (state.hitFirewallMsg) break;
+    }
+    return null;
+  };
+
+  const tryAnthropicUrl = async (msgUrl: string): Promise<Response | null> => {
     const anthropicMessages = messages
       .filter((m) => m.role === 'user' || m.role === 'assistant')
       .map((m) => ({ role: m.role, content: String(m.content || '') }));
 
-    for (const msgUrl of targetMsgUrls) {
-      try {
-        const res = await fetch(msgUrl, {
-          method: 'POST',
-          mode: 'cors',
-          credentials: 'omit',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'text/event-stream, application/json',
-            'x-api-key': apiKey,
-            Authorization: `Bearer ${apiKey}`,
-            'anthropic-version': '2023-06-01',
-            'anthropic-dangerous-direct-browser-access': 'true',
-            ...getBrowserSpoofHeadersForUrl(msgUrl),
-          },
-          body: JSON.stringify({
-            model,
-            max_tokens: typeof maxTokens === 'number' ? maxTokens : 4096,
-            ...(systemPrompt && systemPrompt.trim() ? { system: systemPrompt.trim() } : {}),
-            ...(typeof temperature === 'number' && !reasoningModel ? { temperature } : {}),
-            messages: anthropicMessages,
-            stream: true,
-          }),
-          signal,
-        });
+    try {
+      const res = await fetch(msgUrl, {
+        method: 'POST',
+        mode: 'cors',
+        credentials: 'omit',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream, application/json',
+          'x-api-key': apiKey,
+          Authorization: `Bearer ${apiKey}`,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+          ...getBrowserSpoofHeadersForUrl(msgUrl),
+        },
+        body: JSON.stringify({
+          model,
+          max_tokens: typeof maxTokens === 'number' ? maxTokens : 4096,
+          ...(systemPrompt && systemPrompt.trim() ? { system: systemPrompt.trim() } : {}),
+          ...(typeof temperature === 'number' && !reasoningModel ? { temperature } : {}),
+          messages: anthropicMessages,
+          stream: true,
+        }),
+        signal,
+      });
 
-        const ct = res.headers.get('content-type') || '';
-        if (res.ok && res.body && !isHtmlFirewallOrPage(ct, '')) {
-          return res;
-        }
-      } catch (err: unknown) {
-        if (signal.aborted) throw err;
+      const ct = res.headers.get('content-type') || '';
+      if (res.ok && res.body && !isHtmlFirewallOrPage(ct, '')) {
+        return res;
       }
+    } catch (err: unknown) {
+      if (signal.aborted) throw err;
     }
     return null;
   };
 
-  const isDefinitiveKeyRejection = (err: { status: number; message: string } | null) =>
-    Boolean(
-      err &&
-        err.status === 401 &&
-        /invalid api key|incorrect api key|无效的令牌|未提供令牌/i.test(err.message)
-    );
+  // Fast path: if we already discovered the exact working direct URL & protocol for this baseUrl+model, try it first
+  const cached = browserRouteCache.get(routeKey);
+  if (cached?.transport === 'direct' && cached.endpointUrl && cached.protocol) {
+    if (cached.protocol === 'openai-chat') {
+      const fastRes = await tryOpenAiChatUrl(cached.endpointUrl);
+      if (fastRes) {
+        return {
+          kind: 'ok',
+          response: fastRes,
+          protocol: 'openai-chat',
+          endpointUrl: cached.endpointUrl,
+        };
+      }
+    } else if (cached.protocol === 'openai-responses') {
+      const fastRes = await tryOpenAiResponsesUrl(cached.endpointUrl);
+      if (fastRes) {
+        return {
+          kind: 'ok',
+          response: fastRes,
+          protocol: 'openai-responses',
+          endpointUrl: cached.endpointUrl,
+        };
+      }
+    } else if (cached.protocol === 'anthropic') {
+      const fastRes = await tryAnthropicUrl(cached.endpointUrl);
+      if (fastRes) {
+        return {
+          kind: 'ok',
+          response: fastRes,
+          protocol: 'anthropic',
+          endpointUrl: cached.endpointUrl,
+        };
+      }
+    }
+    browserRouteCache.delete(routeKey);
+  }
+
+  const shouldTrySecondaryProtocol = () => {
+    if (state.hitFirewallMsg) return false;
+    if (!state.lastJsonError) return false;
+    return isEndpointMismatchError(state.lastJsonError.status, state.lastJsonError.message);
+  };
 
   if (preferResponsesFirst) {
-    const rRes = await tryOpenAiResponses(responsesUrls);
-    if (rRes) return { kind: 'ok', response: rRes, protocol: 'openai-responses' };
-    if (!state.hitFirewallMsg && !isDefinitiveKeyRejection(state.lastJsonError)) {
-      const cRes = await tryOpenAiChat(v1Urls);
-      if (cRes) return { kind: 'ok', response: cRes, protocol: 'openai-chat' };
+    const rHit = await tryOpenAiResponses(responsesUrls);
+    if (rHit) {
+      return {
+        kind: 'ok',
+        response: rHit.response,
+        protocol: 'openai-responses',
+        endpointUrl: rHit.endpointUrl,
+      };
+    }
+    if (shouldTrySecondaryProtocol()) {
+      const cHit = await tryOpenAiChat(v1Urls);
+      if (cHit) {
+        return {
+          kind: 'ok',
+          response: cHit.response,
+          protocol: 'openai-chat',
+          endpointUrl: cHit.endpointUrl,
+        };
+      }
     }
   } else {
-    const cRes = await tryOpenAiChat(v1Urls);
-    if (cRes) return { kind: 'ok', response: cRes, protocol: 'openai-chat' };
-    if (!state.hitFirewallMsg && !isDefinitiveKeyRejection(state.lastJsonError)) {
-      const rRes = await tryOpenAiResponses(responsesUrls);
-      if (rRes) return { kind: 'ok', response: rRes, protocol: 'openai-responses' };
+    const cHit = await tryOpenAiChat(v1Urls);
+    if (cHit) {
+      return {
+        kind: 'ok',
+        response: cHit.response,
+        protocol: 'openai-chat',
+        endpointUrl: cHit.endpointUrl,
+      };
+    }
+    if (shouldTrySecondaryProtocol()) {
+      const rHit = await tryOpenAiResponses(responsesUrls);
+      if (rHit) {
+        return {
+          kind: 'ok',
+          response: rHit.response,
+          protocol: 'openai-responses',
+          endpointUrl: rHit.endpointUrl,
+        };
+      }
     }
   }
 
-  // On agentrouter.org, if OpenAI routes returned 404/unsupported (not firewall, not invalid key), try /v1/messages
+  // Only try /v1/messages when endpoint mismatch occurred on agentrouter.org
   if (
-    !state.hitFirewallMsg &&
-    !isDefinitiveKeyRejection(state.lastJsonError) &&
+    shouldTrySecondaryProtocol() &&
     isAgentRouterMainHost(baseUrl) &&
     anthropicMessageUrls.length > 0
   ) {
-    const mRes = await tryAnthropicMessages(anthropicMessageUrls);
-    if (mRes) return { kind: 'ok', response: mRes, protocol: 'anthropic' };
+    for (const msgUrl of anthropicMessageUrls) {
+      const mRes = await tryAnthropicUrl(msgUrl);
+      if (mRes) {
+        return { kind: 'ok', response: mRes, protocol: 'anthropic', endpointUrl: msgUrl };
+      }
+    }
   }
 
   // If agentrouter.org hit a temporary firewall check on the phone IP, try co.agentrouter.org/v1 once
   if (state.hitFirewallMsg && isAgentRouterMainHost(baseUrl)) {
     const savedFirewallMsg = state.hitFirewallMsg;
     const savedJsonError = state.lastJsonError;
-    const coRes = preferResponsesFirst
-      ? await tryOpenAiResponses(['https://co.agentrouter.org/v1/responses'])
-      : await tryOpenAiChat(['https://co.agentrouter.org/v1']);
-    if (coRes) {
-      return {
-        kind: 'ok',
-        response: coRes,
-        protocol: preferResponsesFirst ? 'openai-responses' : 'openai-chat',
-      };
+    if (preferResponsesFirst) {
+      const coHit = await tryOpenAiResponses(['https://co.agentrouter.org/v1/responses']);
+      if (coHit) {
+        return {
+          kind: 'ok',
+          response: coHit.response,
+          protocol: 'openai-responses',
+          endpointUrl: coHit.endpointUrl,
+        };
+      }
+    } else {
+      const coHit = await tryOpenAiChat(['https://co.agentrouter.org/v1']);
+      if (coHit) {
+        return {
+          kind: 'ok',
+          response: coHit.response,
+          protocol: 'openai-chat',
+          endpointUrl: coHit.endpointUrl,
+        };
+      }
     }
     state.hitFirewallMsg = savedFirewallMsg;
     state.lastJsonError = savedJsonError;
@@ -1158,13 +1451,40 @@ export async function consumeWireStream(
     const lines = buffer.split(/\r?\n/);
     buffer = lines.pop() || '';
 
+    let chunkContent = '';
+    let chunkThinking = '';
+    const chunkCallbacks = {
+      onContent: (c: string) => {
+        chunkContent += c;
+      },
+      onThinking: (t: string) => {
+        chunkThinking += t;
+      },
+    };
+
     for (const rawLine of lines) {
-      processLine(rawLine);
+      processLineWithCallbacks(rawLine, chunkCallbacks);
     }
+
+    if (chunkThinking) callbacks.onThinking(chunkThinking);
+    if (chunkContent) callbacks.onContent(chunkContent);
   }
 
   if (buffer.trim()) {
-    processLine(buffer);
+    processLineWithCallbacks(buffer, callbacks);
+  }
+
+  function processLineWithCallbacks(
+    rawLine: string,
+    targetCallbacks: { onContent: (chunk: string) => void; onThinking: (chunk: string) => void }
+  ) {
+    const savedCallbacks = callbacks;
+    callbacks = targetCallbacks;
+    try {
+      processLine(rawLine);
+    } finally {
+      callbacks = savedCallbacks;
+    }
   }
 }
 
@@ -1179,7 +1499,9 @@ export async function testModelOnGateway(params: {
   const wafCookie = sanitizeWafCookie(params.rawWafCookie);
   const startedAt = Date.now();
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 20000);
+  const timeout = setTimeout(() => controller.abort(), 16000);
+  const reasoningModel = isReasoningStyleModel(params.model);
+  const testMaxTokens = reasoningModel ? 64 : 16;
 
   let browserDirectError: string | null = null;
 
@@ -1190,10 +1512,17 @@ export async function testModelOnGateway(params: {
         apiKey,
         model: params.model,
         messages: [{ role: 'user', content: 'Reply with only the single word: Ready' }],
+        maxTokens: testMaxTokens,
+        reasoningEffort: 'low',
         signal: controller.signal,
       });
 
       if (direct.kind === 'ok') {
+        browserRouteCache.set(`${cleanBase}::${params.model}`, {
+          transport: 'direct',
+          protocol: direct.protocol,
+          endpointUrl: direct.endpointUrl,
+        });
         let replyText = '';
         let thinkingText = '';
         await consumeWireStream(direct.response, direct.protocol, {
@@ -1214,7 +1543,6 @@ export async function testModelOnGateway(params: {
 
       if (direct.kind === 'api_error') {
         browserDirectError = direct.message;
-        // Only try server CLI User-Agent fallback on 401/403; return all other JSON errors directly
         if (direct.status !== 401 && direct.status !== 403) {
           clearTimeout(timeout);
           return {
@@ -1242,8 +1570,11 @@ export async function testModelOnGateway(params: {
     clearTimeout(timeout);
     const data = await res.json();
 
+    if (data.ok) {
+      browserRouteCache.set(`${cleanBase}::${params.model}`, { transport: 'proxy' });
+    }
+
     if (!data.ok && browserDirectError && isFirewallErrorString(String(data.error || ''))) {
-      // Never mask a real upstream JSON error received in the browser with Cloud Run's datacenter firewall error
       return {
         ok: false,
         durationMs: Date.now() - startedAt,
@@ -1265,7 +1596,7 @@ export async function testModelOnGateway(params: {
       error:
         browserDirectError ||
         (err instanceof Error && err.name === 'AbortError'
-          ? 'Timed out after 20s'
+          ? 'Timed out after 16s'
           : err instanceof Error
             ? err.message
             : 'Model test failed'),
@@ -1281,6 +1612,7 @@ export async function streamChatFromGateway(params: {
   messages: ChatPayloadMessage[];
   systemPrompt?: string;
   temperature?: number;
+  reasoningEffort?: ReasoningEffortMode;
   signal: AbortSignal;
   onContent: (chunk: string) => void;
   onThinking: (chunk: string) => void;
@@ -1288,10 +1620,12 @@ export async function streamChatFromGateway(params: {
   const apiKey = sanitizeApiKey(params.rawApiKey);
   const cleanBase = sanitizeBaseUrlInput(params.baseUrl);
   const wafCookie = sanitizeWafCookie(params.rawWafCookie);
+  const routeKey = `${cleanBase}::${params.model}`;
+  const cachedRoute = browserRouteCache.get(routeKey);
 
   let browserDirectError: string | null = null;
 
-  if (!wafCookie) {
+  if (!wafCookie && cachedRoute?.transport !== 'proxy') {
     const direct = await openDirectBrowserStream({
       baseUrl: cleanBase,
       apiKey,
@@ -1299,10 +1633,16 @@ export async function streamChatFromGateway(params: {
       messages: params.messages,
       systemPrompt: params.systemPrompt,
       temperature: params.temperature,
+      reasoningEffort: params.reasoningEffort,
       signal: params.signal,
     });
 
     if (direct.kind === 'ok') {
+      browserRouteCache.set(routeKey, {
+        transport: 'direct',
+        protocol: direct.protocol,
+        endpointUrl: direct.endpointUrl,
+      });
       await consumeWireStream(direct.response, direct.protocol, {
         onContent: params.onContent,
         onThinking: params.onThinking,
@@ -1312,7 +1652,6 @@ export async function streamChatFromGateway(params: {
 
     if (direct.kind === 'api_error') {
       browserDirectError = direct.message;
-      // Only fall through to server CLI User-Agent proxy on 401/403
       if (direct.status !== 401 && direct.status !== 403) {
         throw new Error(direct.message);
       }
@@ -1334,11 +1673,15 @@ export async function streamChatFromGateway(params: {
       messages: params.messages,
       systemPrompt: params.systemPrompt,
       temperature: params.temperature,
+      reasoningEffort: params.reasoningEffort,
     }),
     signal: params.signal,
   });
 
   if (!res.ok) {
+    if (cachedRoute?.transport === 'proxy') {
+      browserRouteCache.delete(routeKey);
+    }
     const errJson = await res.json().catch(() => ({}));
     const proxyMsg = String(errJson.error || `Request failed (${res.status})`);
     if (browserDirectError && isFirewallErrorString(proxyMsg)) {
@@ -1350,6 +1693,8 @@ export async function streamChatFromGateway(params: {
   if (!res.body) {
     throw new Error(browserDirectError || 'Empty stream returned from server.');
   }
+
+  browserRouteCache.set(routeKey, { transport: 'proxy' });
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -1363,6 +1708,9 @@ export async function streamChatFromGateway(params: {
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
 
+    let batchContent = '';
+    let batchThinking = '';
+
     for (const rawLine of lines) {
       const line = rawLine.trim();
       if (!line.startsWith('data:')) continue;
@@ -1371,10 +1719,13 @@ export async function streamChatFromGateway(params: {
 
       const packet = JSON.parse(jsonStr);
       if (packet.type === 'content' && typeof packet.delta === 'string') {
-        params.onContent(packet.delta);
+        batchContent += packet.delta;
       } else if (packet.type === 'thinking' && typeof packet.delta === 'string') {
-        params.onThinking(packet.delta);
+        batchThinking += packet.delta;
       } else if (packet.type === 'error') {
+        if (cachedRoute?.transport === 'proxy') {
+          browserRouteCache.delete(routeKey);
+        }
         const proxyMsg = String(packet.message || 'Stream interrupted.');
         if (browserDirectError && isFirewallErrorString(proxyMsg)) {
           throw new Error(browserDirectError);
@@ -1382,5 +1733,8 @@ export async function streamChatFromGateway(params: {
         throw new Error(proxyMsg);
       }
     }
+
+    if (batchThinking) params.onThinking(batchThinking);
+    if (batchContent) params.onContent(batchContent);
   }
 }

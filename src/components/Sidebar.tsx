@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import {
+  ArrowDownToLine,
   ArrowUpRight,
   Check,
   Copy,
@@ -35,6 +36,8 @@ interface SidebarProps {
   onSendSampleInboundRequest: (prompt: string) => Promise<void>;
   darkMode: boolean;
   onToggleDarkMode: () => void;
+  stickyScroll: boolean;
+  onToggleStickyScroll: () => void;
   selectedModel: string;
 }
 
@@ -60,6 +63,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onSendSampleInboundRequest,
   darkMode,
   onToggleDarkMode,
+  stickyScroll,
+  onToggleStickyScroll,
   selectedModel,
 }) => {
   const [section, setSection] = useState<'chats' | 'inbox' | 'roles'>('chats');
@@ -507,26 +512,60 @@ export const Sidebar: React.FC<SidebarProps> = ({
           )}
         </div>
 
-        {/* Footer: User Key Switcher + Theme Toggle */}
-        <div className="p-3 pb-safe border-t border-foreground/10 flex items-center justify-between gap-2 shrink-0">
+        {/* Footer: Sticky Scroll Setting + User Key Switcher + Theme Toggle */}
+        <div className="p-3 pb-safe border-t border-foreground/10 space-y-2 shrink-0">
           <button
             type="button"
-            onClick={() => onOpenKeyManager('keys')}
-            className="min-h-[44px] px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-medium text-foreground flex items-center gap-2 transition-colors min-w-0"
+            role="switch"
+            aria-checked={stickyScroll}
+            onClick={onToggleStickyScroll}
+            className="w-full min-h-[44px] px-3.5 rounded-2xl border border-foreground/12 hover:bg-foreground/[0.04] flex items-center justify-between gap-3 transition-colors text-left"
           >
-            <KeyRound className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
-            <span className="truncate">{activeKey ? activeKey.label : 'Set Base API & Key'}</span>
+            <span className="flex items-center gap-2.5 min-w-0">
+              <ArrowDownToLine className="w-4 h-4 shrink-0 text-muted-foreground" />
+              <span className="min-w-0">
+                <span className="block text-xs font-semibold tracking-tight text-foreground">
+                  Sticky Scroll
+                </span>
+                <span className="block text-[11px] text-muted-foreground truncate">
+                  {stickyScroll ? 'Follows new replies at bottom' : 'Stays put while reading'}
+                </span>
+              </span>
+            </span>
+
+            <span
+              className={`w-10 h-6 rounded-full p-0.5 transition-colors flex items-center shrink-0 ${
+                stickyScroll ? 'bg-foreground justify-end' : 'bg-foreground/15 justify-start'
+              }`}
+            >
+              <span
+                className={`w-5 h-5 rounded-full transition-transform shadow-xs ${
+                  stickyScroll ? 'bg-background' : 'bg-foreground/70'
+                }`}
+              />
+            </span>
           </button>
 
-          <button
-            type="button"
-            onClick={onToggleDarkMode}
-            aria-label="Toggle light and dark mode"
-            className="min-h-[44px] px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
-          >
-            {darkMode ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
-            <span>{darkMode ? 'Light' : 'Dark'}</span>
-          </button>
+          <div className="flex items-center justify-between gap-2">
+            <button
+              type="button"
+              onClick={() => onOpenKeyManager('keys')}
+              className="min-h-[44px] px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-semibold text-foreground flex items-center gap-2 transition-colors min-w-0 flex-1"
+            >
+              <KeyRound className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
+              <span className="truncate">{activeKey ? activeKey.label : 'Set Base API & Key'}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={onToggleDarkMode}
+              aria-label="Toggle light and dark mode"
+              className="min-h-[44px] px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-medium text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+            >
+              {darkMode ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
+              <span>{darkMode ? 'Light' : 'Dark'}</span>
+            </button>
+          </div>
         </div>
       </aside>
     </>

@@ -10,8 +10,10 @@ import {
   SlidersHorizontal,
   Square,
   X,
+  Zap,
 } from 'lucide-react';
 import { AgentRole, Attachment, ModelOption, ModelTestResult } from '../types';
+import { isReasoningStyleModel } from '../utils/gateway';
 
 interface ComposerProps {
   input: string;
@@ -34,6 +36,8 @@ interface ComposerProps {
   roles: AgentRole[];
   selectedRole: AgentRole;
   onSelectRole: (roleId: string) => void;
+  fastReplies: boolean;
+  onToggleFastReplies: () => void;
 }
 
 export const Composer: React.FC<ComposerProps> = ({
@@ -57,6 +61,8 @@ export const Composer: React.FC<ComposerProps> = ({
   roles,
   selectedRole,
   onSelectRole,
+  fastReplies,
+  onToggleFastReplies,
 }) => {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -166,7 +172,7 @@ export const Composer: React.FC<ComposerProps> = ({
 
         {/* Bottom Action Toolbar */}
         <div className="flex items-center justify-between gap-2 px-2.5 sm:px-3.5 pb-2.5 pt-1">
-          <div className="flex items-center gap-1 min-w-0">
+          <div className="flex items-center gap-1 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
             <input
               ref={fileInputRef}
               type="file"
@@ -179,7 +185,7 @@ export const Composer: React.FC<ComposerProps> = ({
               type="button"
               onClick={() => fileInputRef.current?.click()}
               title="Attach text or code file"
-              className="min-h-[44px] min-w-[44px] rounded-full flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/5 transition-colors shrink-0"
+              className="min-h-[44px] min-w-[40px] sm:min-w-[44px] rounded-full flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/5 transition-colors shrink-0"
             >
               <Paperclip className="w-[17px] h-[17px]" />
             </button>
@@ -191,9 +197,9 @@ export const Composer: React.FC<ComposerProps> = ({
                 setShowRoleSheet((v) => !v);
                 setShowModelSheet(false);
               }}
-              className="min-h-[44px] px-3 rounded-full text-xs font-mono text-foreground hover:bg-foreground/5 flex items-center gap-1 transition-colors whitespace-nowrap shrink-0"
+              className="min-h-[44px] px-2.5 sm:px-3 rounded-full text-xs font-mono font-medium text-foreground hover:bg-foreground/5 flex items-center gap-1 transition-colors whitespace-nowrap shrink-0"
             >
-              <span className="truncate max-w-[86px] sm:max-w-[130px]">{selectedRole.name}</span>
+              <span className="truncate max-w-[78px] sm:max-w-[130px]">{selectedRole.name}</span>
               <ChevronDown className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
             </button>
 
@@ -208,11 +214,33 @@ export const Composer: React.FC<ComposerProps> = ({
                 setShowModelSheet((v) => !v);
                 setShowRoleSheet(false);
               }}
-              className="min-h-[44px] px-3 rounded-full text-xs font-mono text-muted-foreground hover:text-foreground hover:bg-foreground/5 flex items-center gap-1 transition-colors min-w-0"
+              className="min-h-[44px] px-2.5 sm:px-3 rounded-full text-xs font-mono font-medium text-muted-foreground hover:text-foreground hover:bg-foreground/5 flex items-center gap-1 transition-colors shrink-0"
             >
-              <span className="truncate max-w-[110px] sm:max-w-[190px]">{modelButtonText}</span>
+              <span className="truncate max-w-[100px] sm:max-w-[190px]">{modelButtonText}</span>
               <ChevronDown className="w-3.5 h-3.5 opacity-70 shrink-0" />
             </button>
+
+            {/* Reasoning Speed Toggle (Fast low-effort vs Deep thinking) */}
+            {Boolean(selectedModel) && isReasoningStyleModel(selectedModel) && (
+              <button
+                type="button"
+                onClick={onToggleFastReplies}
+                title={
+                  fastReplies
+                    ? 'Fast replies active (tap to switch to deeper thinking)'
+                    : 'Deeper thinking active (tap to switch to fast replies)'
+                }
+                aria-pressed={fastReplies}
+                className={`min-h-[40px] px-2.5 rounded-full text-xs font-mono font-medium flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+                  fastReplies
+                    ? 'bg-foreground/[0.07] text-foreground'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-foreground/5'
+                }`}
+              >
+                <Zap className={`w-3 h-3 shrink-0 ${fastReplies ? 'fill-current' : ''}`} />
+                <span>{fastReplies ? 'Fast' : 'Deep'}</span>
+              </button>
+            )}
           </div>
 
           {/* Optimus Monochrome Capsule Primary Send / Stop Action */}

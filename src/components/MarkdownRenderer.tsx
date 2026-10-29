@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { Check, Copy, Maximize2 } from 'lucide-react';
 import { ArtifactItem } from '../types';
 
@@ -271,12 +271,12 @@ function CodeBlockCard({
   );
 }
 
-export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
+const MarkdownRendererInner: React.FC<MarkdownRendererProps> = ({
   content,
   messageId,
   onOpenArtifact,
 }) => {
-  const blocks = parseBlocks(content);
+  const blocks = useMemo(() => parseBlocks(content), [content]);
 
   return (
     <div className="space-y-4 text-[15.5px] sm:text-base leading-relaxed text-foreground/90 break-words">
@@ -396,3 +396,11 @@ export const MarkdownRenderer: React.FC<MarkdownRendererProps> = ({
     </div>
   );
 };
+
+export const MarkdownRenderer = React.memo(
+  MarkdownRendererInner,
+  (prev, next) =>
+    prev.content === next.content &&
+    prev.messageId === next.messageId &&
+    prev.onOpenArtifact === next.onOpenArtifact
+);
