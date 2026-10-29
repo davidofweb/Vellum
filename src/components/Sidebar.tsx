@@ -4,6 +4,7 @@ import {
   ArrowUpRight,
   Check,
   Copy,
+  Download,
   KeyRound,
   Moon,
   Plus,
@@ -38,6 +39,8 @@ interface SidebarProps {
   onToggleDarkMode: () => void;
   stickyScroll: boolean;
   onToggleStickyScroll: () => void;
+  showInstallButton: boolean;
+  onInstallApp: () => void;
   selectedModel: string;
 }
 
@@ -65,6 +68,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToggleDarkMode,
   stickyScroll,
   onToggleStickyScroll,
+  showInstallButton,
+  onInstallApp,
   selectedModel,
 }) => {
   const [section, setSection] = useState<'chats' | 'inbox' | 'roles'>('chats');
@@ -512,8 +517,29 @@ export const Sidebar: React.FC<SidebarProps> = ({
           )}
         </div>
 
-        {/* Footer: Sticky Scroll Setting + User Key Switcher + Theme Toggle */}
+        {/* Footer: Install App + Sticky Scroll Setting + User Key Switcher + Theme Toggle */}
         <div className="p-3 pb-safe border-t border-foreground/10 space-y-2 shrink-0">
+          {showInstallButton && (
+            <button
+              type="button"
+              onClick={onInstallApp}
+              className="w-full min-h-[44px] px-3.5 rounded-2xl bg-foreground text-background hover:bg-foreground/90 flex items-center justify-between gap-3 transition-colors text-left"
+            >
+              <span className="flex items-center gap-2.5 min-w-0">
+                <Download className="w-4 h-4 shrink-0" />
+                <span className="min-w-0">
+                  <span className="block text-xs font-semibold tracking-tight">
+                    Install Vellum App
+                  </span>
+                  <span className="block text-[11px] opacity-75 truncate">
+                    Add to home screen or desktop
+                  </span>
+                </span>
+              </span>
+              <ArrowUpRight className="w-4 h-4 shrink-0 opacity-80" />
+            </button>
+          )}
+
           <button
             type="button"
             role="switch"

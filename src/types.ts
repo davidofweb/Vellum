@@ -18,11 +18,13 @@ export interface ChatMessage {
   role: 'user' | 'assistant';
   content: string;
   thinking?: string;
+  thinkingSeconds?: number;
   attachments?: Attachment[];
   model?: string;
   createdAt: number;
   error?: string;
   isStreaming?: boolean;
+  interrupted?: boolean;
 }
 
 export interface Conversation {

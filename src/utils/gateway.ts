@@ -990,12 +990,10 @@ async function openDirectBrowserStream(params: {
         ],
       }));
 
-    const canSendEffort =
-      reasoningModel &&
-      reasoningEffort === 'low' &&
-      !unsupportedReasoningParamCache.has(routeKey);
+    const canSendReasoning =
+      reasoningModel && !unsupportedReasoningParamCache.has(routeKey);
 
-    const sendRespPost = async (includeEffort: boolean): Promise<Response> =>
+    const sendRespPost = async (includeReasoning: boolean): Promise<Response> =>
       fetch(respUrl, {
         method: 'POST',
         mode: 'cors',
@@ -1011,7 +1009,14 @@ async function openDirectBrowserStream(params: {
           ...(systemPrompt && systemPrompt.trim() ? { instructions: systemPrompt.trim() } : {}),
           input: responsesInput,
           stream: true,
-          ...(includeEffort ? { reasoning: { effort: 'low' } } : {}),
+          ...(includeReasoning
+            ? {
+                reasoning: {
+                  effort: reasoningEffort === 'low' ? 'low' : 'medium',
+                  summary: 'auto',
+                },
+              }
+            : {}),
           ...(typeof temperature === 'number' && !reasoningModel ? { temperature } : {}),
           ...(typeof maxTokens === 'number' ? { max_output_tokens: maxTokens } : {}),
         }),
@@ -1019,7 +1024,7 @@ async function openDirectBrowserStream(params: {
       });
 
     try {
-      let res = await sendRespPost(canSendEffort);
+      let res = await sendRespPost(canSendReasoning);
       let ct = res.headers.get('content-type') || '';
 
       if (res.ok && res.body) {
@@ -1039,7 +1044,11 @@ async function openDirectBrowserStream(params: {
 
       let parsedMsg = parseGatewayErrorText(errBody, res.status, ct, respUrl);
 
-      if (canSendEffort && isReasoningParamRejectedError(res.status, parsedMsg)) {
+      if (
+        canSendReasoning &&
+        (isReasoningParamRejectedError(res.status, parsedMsg) ||
+          (res.status === 400 && /summary|reasoning/i.test(parsedMsg)))
+      ) {
         unsupportedReasoningParamCache.add(routeKey);
         res = await sendRespPost(false);
         ct = res.headers.get('content-type') || '';
@@ -1312,6 +1321,14 @@ export async function consumeWireStream(
       return;
     }
 
+    const openAiReasoning =
+      json?.choices?.[0]?.message?.reasoning_content ??
+      json?.choices?.[0]?.message?.reasoning ??
+      json?.data?.choices?.[0]?.message?.reasoning_content;
+    if (typeof openAiReasoning === 'string' && openAiReasoning) {
+      callbacks.onThinking(openAiReasoning);
+    }
+
     const openAiText =
       json?.choices?.[0]?.message?.content ?? json?.data?.choices?.[0]?.message?.content;
     if (typeof openAiText === 'string' && openAiText) {
@@ -1433,8 +1450,12 @@ export async function consumeWireStream(
 
     if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
       callbacks.onThinking(delta.reasoning_content);
+    } else if (typeof delta.reasoning === 'string' && delta.reasoning) {
+      callbacks.onThinking(delta.reasoning);
     } else if (typeof delta.thinking === 'string' && delta.thinking) {
       callbacks.onThinking(delta.thinking);
+    } else if (typeof delta.thought === 'string' && delta.thought) {
+      callbacks.onThinking(delta.thought);
     }
 
     if (typeof delta.content === 'string' && delta.content) {

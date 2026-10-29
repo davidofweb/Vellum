@@ -854,12 +854,10 @@ async function openUpstreamStream(params: {
     respUrl: string,
     profileIdx: number
   ): Promise<globalThis.Response | null> => {
-    const canSendEffort =
-      reasoningModel &&
-      reasoningEffort === 'low' &&
-      !unsupportedServerReasoningCache.has(routeKey);
+    const canSendReasoning =
+      reasoningModel && !unsupportedServerReasoningCache.has(routeKey);
 
-    const postOnce = (includeEffort: boolean) =>
+    const postOnce = (includeReasoning: boolean) =>
       fetchWithWafHandling(
         respUrl,
         {
@@ -875,7 +873,14 @@ async function openUpstreamStream(params: {
             ...(systemPrompt && systemPrompt.trim() ? { instructions: systemPrompt.trim() } : {}),
             input: responsesInput,
             stream: true,
-            ...(includeEffort ? { reasoning: { effort: 'low' } } : {}),
+            ...(includeReasoning
+              ? {
+                  reasoning: {
+                    effort: reasoningEffort === 'low' ? 'low' : 'medium',
+                    summary: 'auto',
+                  },
+                }
+              : {}),
             ...(typeof temperature === 'number' && !reasoningModel ? { temperature } : {}),
             ...(typeof maxTokens === 'number' ? { max_output_tokens: maxTokens } : {}),
           }),
@@ -884,7 +889,7 @@ async function openUpstreamStream(params: {
         wafCookie
       );
 
-    let res = await postOnce(canSendEffort);
+    let res = await postOnce(canSendReasoning);
     let contentType = res.headers.get('content-type') || '';
 
     if (res.ok && res.body && !isHtmlFirewallOrPage(contentType, '')) {
@@ -899,7 +904,11 @@ async function openUpstreamStream(params: {
     }
 
     const msg = parseErrorMessage(errText, res.status, contentType, respUrl);
-    if (canSendEffort && isReasoningParamRejectedError(res.status, msg)) {
+    if (
+      canSendReasoning &&
+      (isReasoningParamRejectedError(res.status, msg) ||
+        (res.status === 400 && /summary|reasoning/i.test(msg)))
+    ) {
       unsupportedServerReasoningCache.add(routeKey);
       res = await postOnce(false);
       contentType = res.headers.get('content-type') || '';
@@ -1162,6 +1171,14 @@ async function consumeAgentRouterStream(
       return;
     }
 
+    const openAiReasoning =
+      json?.choices?.[0]?.message?.reasoning_content ??
+      json?.choices?.[0]?.message?.reasoning ??
+      json?.data?.choices?.[0]?.message?.reasoning_content;
+    if (typeof openAiReasoning === 'string' && openAiReasoning) {
+      callbacks.onThinking(openAiReasoning);
+    }
+
     const openAiText =
       json?.choices?.[0]?.message?.content ?? json?.data?.choices?.[0]?.message?.content;
     if (typeof openAiText === 'string' && openAiText) {
@@ -1271,8 +1288,12 @@ async function consumeAgentRouterStream(
 
       if (typeof delta.reasoning_content === 'string' && delta.reasoning_content) {
         callbacks.onThinking(delta.reasoning_content);
+      } else if (typeof delta.reasoning === 'string' && delta.reasoning) {
+        callbacks.onThinking(delta.reasoning);
       } else if (typeof delta.thinking === 'string' && delta.thinking) {
         callbacks.onThinking(delta.thinking);
+      } else if (typeof delta.thought === 'string' && delta.thought) {
+        callbacks.onThinking(delta.thought);
       }
 
       if (typeof delta.content === 'string' && delta.content) {

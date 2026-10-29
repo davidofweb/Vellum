@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  Download,
   Eye,
   EyeOff,
   GitBranch,
@@ -17,6 +18,7 @@ import {
   Moon,
   PanelLeftClose,
   PanelLeftOpen,
+  Play,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -24,6 +26,7 @@ import {
   Square,
   Sun,
   Volume2,
+  WifiOff,
 } from 'lucide-react';
 import {
   AgentRole,
@@ -54,7 +57,13 @@ import { CanvasDrawer } from './components/CanvasDrawer';
 import { Sidebar } from './components/Sidebar';
 import { Composer } from './components/Composer';
 import { KeyModelsModal } from './components/KeyModelsModal';
+import { InstallAppModal } from './components/InstallAppModal';
 import { isSpeechSynthesisSupported, prepareTextForSpeech } from './utils/speech';
+import {
+  createThinkStreamSplitter,
+  withThinkingInstruction,
+} from './utils/streamThinkParser';
+import { useOnlineStatus, usePWAInstall } from './hooks/usePWAInstall';
 
 const STORAGE_CHATS_KEY = 'vellum_conversations_v2';
 const STORAGE_ROLES_KEY = 'vellum_custom_roles_v2';
@@ -65,6 +74,26 @@ const STORAGE_ACTIVE_KEY_ID = 'vellum_active_key_id_v2';
 const STORAGE_WORKSPACE_ID = 'vellum_workspace_id_v2';
 const STORAGE_FAST_REPLIES_KEY = 'vellum_fast_replies_v1';
 const STORAGE_STICKY_SCROLL_KEY = 'vellum_sticky_scroll_v1';
+const STORAGE_ACTIVE_CHAT_ID = 'vellum_active_chat_id_v1';
+const STORAGE_DRAFT_INPUT_KEY = 'vellum_draft_input_v1';
+
+function recoverSavedConversations(rawList: unknown): Conversation[] | null {
+  if (!Array.isArray(rawList) || rawList.length === 0) return null;
+  return rawList.map((conv: Conversation) => ({
+    ...conv,
+    messages: Array.isArray(conv.messages)
+      ? conv.messages.map((m) =>
+          m.isStreaming
+            ? {
+                ...m,
+                isStreaming: false,
+                interrupted: true,
+              }
+            : m
+        )
+      : [],
+  }));
+}
 
 function getOrCreateWorkspaceId(): string {
   try {
@@ -158,8 +187,8 @@ export default function App() {
     try {
       const raw = localStorage.getItem(STORAGE_CHATS_KEY);
       if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        const recovered = recoverSavedConversations(JSON.parse(raw));
+        if (recovered) return recovered;
       }
     } catch {
       // Ignore
@@ -167,19 +196,38 @@ export default function App() {
     return [createBlankConversation('', BUILT_IN_ROLES[0].id)];
   });
 
-  const [activeId, setActiveId] = useState<string>(() => conversations[0]?.id || '');
+  const [activeId, setActiveId] = useState<string>(() => {
+    try {
+      const savedId = localStorage.getItem(STORAGE_ACTIVE_CHAT_ID);
+      if (savedId && conversations.some((c) => c.id === savedId)) {
+        return savedId;
+      }
+    } catch {
+      // Ignore
+    }
+    return conversations[0]?.id || '';
+  });
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() =>
     typeof window !== 'undefined' ? window.innerWidth >= 1280 : false
   );
 
-  const [input, setInput] = useState('');
+  const [input, setInput] = useState<string>(() => {
+    try {
+      return localStorage.getItem(STORAGE_DRAFT_INPUT_KEY) || '';
+    } catch {
+      return '';
+    }
+  });
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [liveThinkingSec, setLiveThinkingSec] = useState(0);
   const [activeArtifact, setActiveArtifact] = useState<ArtifactItem | null>(null);
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
   const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
   const [speechSupported] = useState<boolean>(() => isSpeechSynthesisSupported());
-  const [expandedThinking, setExpandedThinking] = useState<Record<string, boolean>>({});
+  const [expandedThinking, setExpandedThinking] = useState<
+    Record<string, boolean | undefined>
+  >({});
   const [inboxTasks, setInboxTasks] = useState<InboundAgentTask[]>([]);
   const [fastReplies, setFastReplies] = useState<boolean>(() => {
     try {
@@ -200,6 +248,16 @@ export default function App() {
     return true;
   });
   const [showJumpToBottom, setShowJumpToBottom] = useState(false);
+  const [installModalOpen, setInstallModalOpen] = useState(false);
+
+  const {
+    canPromptDirectly,
+    isInstalled: isAppInstalled,
+    isIOS,
+    isInIframe,
+    install: promptInstallApp,
+  } = usePWAInstall();
+  const isOnline = useOnlineStatus();
 
   const [managerOpen, setManagerOpen] = useState(false);
   const [managerTab, setManagerTab] = useState<'models' | 'keys'>('models');
@@ -219,6 +277,14 @@ export default function App() {
   const userScrolledUpRef = useRef<boolean>(false);
   const lastScrollTopRef = useRef<number>(0);
   const programmaticScrollRef = useRef<boolean>(false);
+  const conversationsRef = useRef<Conversation[]>(conversations);
+  const activeIdRef = useRef<string>(activeId);
+  const draftInputRef = useRef<string>(input);
+  const lastSavedChatsAtRef = useRef<number>(0);
+
+  conversationsRef.current = conversations;
+  activeIdRef.current = activeId;
+  draftInputRef.current = input;
 
   const stopSpeaking = useCallback(() => {
     speechSessionRef.current += 1;
@@ -263,14 +329,76 @@ export default function App() {
     }
   }, [activeKeyObj?.id]);
 
-  useEffect(() => {
-    if (isStreaming) return;
+  const persistConversationsSnapshot = useCallback((snapshot: Conversation[]) => {
     try {
-      localStorage.setItem(STORAGE_CHATS_KEY, JSON.stringify(conversations));
+      localStorage.setItem(STORAGE_CHATS_KEY, JSON.stringify(snapshot));
+      lastSavedChatsAtRef.current = Date.now();
     } catch {
       // Ignore
     }
-  }, [conversations, isStreaming]);
+  }, []);
+
+  useEffect(() => {
+    if (!isStreaming) {
+      persistConversationsSnapshot(conversations);
+      return;
+    }
+
+    const elapsed = Date.now() - lastSavedChatsAtRef.current;
+    if (elapsed >= 700) {
+      persistConversationsSnapshot(conversations);
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      persistConversationsSnapshot(conversationsRef.current);
+    }, 700 - elapsed);
+    return () => window.clearTimeout(timer);
+  }, [conversations, isStreaming, persistConversationsSnapshot]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_ACTIVE_CHAT_ID, activeId);
+    } catch {
+      // Ignore
+    }
+  }, [activeId]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_DRAFT_INPUT_KEY, input);
+    } catch {
+      // Ignore
+    }
+  }, [input]);
+
+  useEffect(() => {
+    const flushAllProgress = () => {
+      try {
+        localStorage.setItem(STORAGE_CHATS_KEY, JSON.stringify(conversationsRef.current));
+        localStorage.setItem(STORAGE_ACTIVE_CHAT_ID, activeIdRef.current);
+        localStorage.setItem(STORAGE_DRAFT_INPUT_KEY, draftInputRef.current);
+      } catch {
+        // Ignore
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        flushAllProgress();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', flushAllProgress);
+    window.addEventListener('beforeunload', flushAllProgress);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', flushAllProgress);
+      window.removeEventListener('beforeunload', flushAllProgress);
+    };
+  }, []);
 
   useEffect(() => {
     try {
@@ -785,13 +913,30 @@ export default function App() {
     setShowJumpToBottom(Boolean(activeConversation?.messages.length) && distanceFromBottom > 120);
   }, [activeConversation?.messages, isStreaming, stickyScroll]);
 
+  const handleInstallClick = useCallback(async () => {
+    if (canPromptDirectly) {
+      const result = await promptInstallApp();
+      if (result === 'manual') {
+        setInstallModalOpen(true);
+      }
+      return;
+    }
+    setInstallModalOpen(true);
+  }, [canPromptDirectly, promptInstallApp]);
+
   const streamAgentResponse = useCallback(
     async (
       convId: string,
       historyMessages: ChatMessage[],
       modelToUse: string,
       roleToUse: AgentRole,
-      userKey: SavedUserKey
+      userKey: SavedUserKey,
+      resumeTarget?: {
+        msgId: string;
+        existingContent: string;
+        existingThinking: string;
+        existingSeconds: number;
+      }
     ) => {
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
@@ -800,31 +945,64 @@ export default function App() {
       const controller = new AbortController();
       abortControllerRef.current = controller;
 
-      const assistantMsgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-      const initialAssistantMessage: ChatMessage = {
-        id: assistantMsgId,
-        role: 'assistant',
-        content: '',
-        thinking: '',
-        model: modelToUse,
-        createdAt: Date.now(),
-        isStreaming: true,
-      };
+      const assistantMsgId =
+        resumeTarget?.msgId || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const baseSeconds = resumeTarget?.existingSeconds || 0;
 
       setIsStreaming(true);
+      setLiveThinkingSec(baseSeconds);
       userScrolledUpRef.current = false;
 
-      setConversations((prev) =>
-        prev.map((c) =>
-          c.id === convId
-            ? {
-                ...c,
-                messages: [...historyMessages, initialAssistantMessage],
-                updatedAt: Date.now(),
-              }
-            : c
-        )
-      );
+      if (resumeTarget) {
+        setConversations((prev) => {
+          const next = prev.map((c) =>
+            c.id === convId
+              ? {
+                  ...c,
+                  messages: c.messages.map((m) =>
+                    m.id === assistantMsgId
+                      ? {
+                          ...m,
+                          isStreaming: true,
+                          interrupted: false,
+                          error: undefined,
+                        }
+                      : m
+                  ),
+                  updatedAt: Date.now(),
+                }
+              : c
+          );
+          persistConversationsSnapshot(next);
+          return next;
+        });
+      } else {
+        const initialAssistantMessage: ChatMessage = {
+          id: assistantMsgId,
+          role: 'assistant',
+          content: '',
+          thinking: '',
+          thinkingSeconds: 0,
+          model: modelToUse,
+          createdAt: Date.now(),
+          isStreaming: true,
+          interrupted: false,
+        };
+
+        setConversations((prev) => {
+          const next = prev.map((c) =>
+            c.id === convId
+              ? {
+                  ...c,
+                  messages: [...historyMessages, initialAssistantMessage],
+                  updatedAt: Date.now(),
+                }
+              : c
+          );
+          persistConversationsSnapshot(next);
+          return next;
+        });
+      }
 
       if (stickyScrollRef.current) {
         requestAnimationFrame(() => scrollToBottom('smooth'));
@@ -844,13 +1022,37 @@ export default function App() {
         };
       });
 
-      let rafId: number | null = null;
-      let accumulatedContent = '';
-      let accumulatedThinking = '';
+      if (resumeTarget && resumeTarget.existingContent.trim()) {
+        payloadMessages.push({
+          role: 'assistant',
+          content: resumeTarget.existingContent,
+        });
+        payloadMessages.push({
+          role: 'user',
+          content:
+            'Continue directly from the exact character where your previous output stopped. Do not repeat earlier code or text; finish the remaining output cleanly.',
+        });
+      }
 
-      const commitStreamState = (done = false) => {
-        setConversations((prev) =>
-          prev.map((c) =>
+      let rafId: number | null = null;
+      let bgTimerId: number | null = null;
+      let accumulatedContent = resumeTarget?.existingContent || '';
+      let accumulatedThinking = resumeTarget?.existingThinking || '';
+      const startedThinkingAt = Date.now();
+      let recordedThinkingSec = baseSeconds;
+      let hasStartedContent = Boolean(resumeTarget?.existingContent);
+
+      const tickInterval = window.setInterval(() => {
+        if (!hasStartedContent) {
+          const sec = baseSeconds + Math.max(1, Math.round((Date.now() - startedThinkingAt) / 1000));
+          recordedThinkingSec = sec;
+          setLiveThinkingSec(sec);
+        }
+      }, 1000);
+
+      const commitStreamState = (done = false, interrupted = false) => {
+        setConversations((prev) => {
+          const next = prev.map((c) =>
             c.id === convId
               ? {
                   ...c,
@@ -860,24 +1062,74 @@ export default function App() {
                           ...m,
                           content: accumulatedContent,
                           thinking: accumulatedThinking,
-                          ...(done ? { isStreaming: false } : {}),
+                          thinkingSeconds: recordedThinkingSec || undefined,
+                          ...(done
+                            ? {
+                                isStreaming: false,
+                                interrupted,
+                              }
+                            : {}),
                         }
                       : m
                   ),
                   ...(done ? { updatedAt: Date.now() } : {}),
                 }
               : c
-          )
-        );
+          );
+          if (done || document.visibilityState === 'hidden') {
+            persistConversationsSnapshot(next);
+          }
+          return next;
+        });
+      };
+
+      const cancelPendingFlush = () => {
+        if (rafId !== null) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+        if (bgTimerId !== null) {
+          window.clearTimeout(bgTimerId);
+          bgTimerId = null;
+        }
       };
 
       const scheduleStreamFlush = () => {
+        if (document.visibilityState === 'hidden') {
+          if (bgTimerId !== null) return;
+          bgTimerId = window.setTimeout(() => {
+            bgTimerId = null;
+            commitStreamState(false);
+          }, 220);
+          return;
+        }
         if (rafId !== null) return;
         rafId = requestAnimationFrame(() => {
           rafId = null;
           commitStreamState(false);
         });
       };
+
+      const splitter = createThinkStreamSplitter({
+        onContent: (cleanDelta) => {
+          if (!hasStartedContent && cleanDelta.trim()) {
+            hasStartedContent = true;
+            recordedThinkingSec =
+              baseSeconds + Math.max(1, Math.round((Date.now() - startedThinkingAt) / 1000));
+            setLiveThinkingSec(recordedThinkingSec);
+          }
+          accumulatedContent += cleanDelta;
+          scheduleStreamFlush();
+        },
+        onThinking: (cleanThought) => {
+          if (!hasStartedContent) {
+            recordedThinkingSec =
+              baseSeconds + Math.max(1, Math.round((Date.now() - startedThinkingAt) / 1000));
+          }
+          accumulatedThinking += cleanThought;
+          scheduleStreamFlush();
+        },
+      });
 
       try {
         await streamChatFromGateway({
@@ -886,25 +1138,25 @@ export default function App() {
           rawWafCookie: userKey.wafCookie,
           model: modelToUse,
           messages: payloadMessages,
-          systemPrompt: roleToUse.instructions,
+          systemPrompt: withThinkingInstruction(roleToUse.instructions),
           temperature: roleToUse.temperature,
           reasoningEffort: fastReplies ? 'low' : 'medium',
           signal: controller.signal,
           onContent: (delta) => {
-            accumulatedContent += delta;
-            scheduleStreamFlush();
+            splitter.pushContent(delta);
           },
           onThinking: (delta) => {
-            accumulatedThinking += delta;
-            scheduleStreamFlush();
+            if (accumulatedThinking && !accumulatedThinking.endsWith('\n') && delta.startsWith('-')) {
+              splitter.pushNativeThinking(`\n${delta}`);
+            } else {
+              splitter.pushNativeThinking(delta);
+            }
           },
         });
 
-        if (rafId !== null) {
-          cancelAnimationFrame(rafId);
-          rafId = null;
-        }
-        commitStreamState(true);
+        splitter.flush();
+        cancelPendingFlush();
+        commitStreamState(true, false);
 
         const extracted = extractArtifactsFromText(assistantMsgId, accumulatedContent);
         const firstPreviewable = extracted.find((a) => a.previewable);
@@ -912,35 +1164,48 @@ export default function App() {
           setActiveArtifact(firstPreviewable);
         }
       } catch (err: unknown) {
-        if (rafId !== null) {
-          cancelAnimationFrame(rafId);
-          rafId = null;
-        }
+        splitter.flush();
+        cancelPendingFlush();
         if (controller.signal.aborted) {
-          commitStreamState(true);
+          commitStreamState(true, true);
         } else {
           const message = err instanceof Error ? err.message : 'Something went wrong.';
-          setConversations((prev) =>
-            prev.map((c) =>
+          const hasPartialProgress = Boolean(
+            accumulatedContent.trim() || accumulatedThinking.trim()
+          );
+          setConversations((prev) => {
+            const next = prev.map((c) =>
               c.id === convId
                 ? {
                     ...c,
                     messages: c.messages.map((m) =>
                       m.id === assistantMsgId
-                        ? { ...m, isStreaming: false, error: message }
+                        ? {
+                            ...m,
+                            content: accumulatedContent,
+                            thinking: accumulatedThinking,
+                            thinkingSeconds: recordedThinkingSec || undefined,
+                            isStreaming: false,
+                            interrupted: hasPartialProgress,
+                            error: message,
+                          }
                         : m
                     ),
+                    updatedAt: Date.now(),
                   }
                 : c
-            )
-          );
+            );
+            persistConversationsSnapshot(next);
+            return next;
+          });
         }
       } finally {
+        window.clearInterval(tickInterval);
         setIsStreaming(false);
         abortControllerRef.current = null;
       }
     },
-    [scrollToBottom, fastReplies]
+    [scrollToBottom, fastReplies, persistConversationsSnapshot]
   );
 
   const handleSend = useCallback(
@@ -1061,6 +1326,40 @@ export default function App() {
       selectedModel,
       selectedRole,
       activeKeyObj
+    );
+  };
+
+  const handleContinueInterruptedMessage = (assistantMsgIndex: number) => {
+    if (isStreaming || !activeConversation || !activeKeyObj || !selectedModel) return;
+    stopSpeaking();
+    const targetMsg = activeConversation.messages[assistantMsgIndex];
+    if (!targetMsg || targetMsg.role !== 'assistant') return;
+    const historyBefore = activeConversation.messages.slice(0, assistantMsgIndex);
+    if (historyBefore.length === 0) return;
+
+    if (!targetMsg.content.trim()) {
+      streamAgentResponse(
+        activeConversation.id,
+        historyBefore,
+        targetMsg.model || selectedModel,
+        selectedRole,
+        activeKeyObj
+      );
+      return;
+    }
+
+    streamAgentResponse(
+      activeConversation.id,
+      historyBefore,
+      targetMsg.model || selectedModel,
+      selectedRole,
+      activeKeyObj,
+      {
+        msgId: targetMsg.id,
+        existingContent: targetMsg.content,
+        existingThinking: targetMsg.thinking || '',
+        existingSeconds: targetMsg.thinkingSeconds || 0,
+      }
     );
   };
 
@@ -1263,6 +1562,8 @@ export default function App() {
         onToggleDarkMode={() => setDarkMode((d) => !d)}
         stickyScroll={stickyScroll}
         onToggleStickyScroll={handleToggleStickyScroll}
+        showInstallButton={!isAppInstalled}
+        onInstallApp={handleInstallClick}
         selectedModel={selectedModel}
       />
 
@@ -1363,6 +1664,19 @@ export default function App() {
               </span>
             </button>
 
+            {!isAppInstalled && (
+              <button
+                type="button"
+                onClick={handleInstallClick}
+                aria-label="Install Vellum app"
+                title="Install Vellum app"
+                className="min-h-[40px] min-w-[40px] lg:px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-medium text-foreground flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+              >
+                <Download className="w-3.5 h-3.5 shrink-0" />
+                <span className="hidden lg:inline">Install</span>
+              </button>
+            )}
+
             <button
               type="button"
               onClick={() => setDarkMode((d) => !d)}
@@ -1384,6 +1698,13 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        {!isOnline && (
+          <div className="px-4 py-2 border-b border-foreground/15 bg-foreground/[0.04] flex items-center justify-center gap-2 text-xs font-medium text-foreground shrink-0">
+            <WifiOff className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
+            <span>Offline — your saved chats stay available here until you reconnect.</span>
+          </div>
+        )}
 
         {/* Scrollable Stage */}
         <div className="relative flex-1 min-h-0 flex flex-col">
@@ -1645,7 +1966,14 @@ export default function App() {
                   !isUser && !msg.isStreaming
                     ? extractArtifactsFromText(msg.id, msg.content)
                     : [];
-                const thinkingOpen = Boolean(expandedThinking[msg.id]);
+                const userToggledThinking = expandedThinking[msg.id];
+                const thinkingOpen =
+                  userToggledThinking !== undefined
+                    ? userToggledThinking
+                    : Boolean(msg.isStreaming);
+                const activeThinkingSecs = msg.isStreaming
+                  ? liveThinkingSec || msg.thinkingSeconds || 0
+                  : msg.thinkingSeconds || 0;
 
                 if (isUser) {
                   return (
@@ -1669,30 +1997,44 @@ export default function App() {
                     key={msg.id}
                     className="space-y-3.5 pb-6 border-b border-foreground/10 last:border-b-0"
                   >
-                    {msg.thinking && (
-                      <div>
+                    {(msg.thinking || (msg.isStreaming && !msg.content)) && (
+                      <div className="rounded-2xl border border-foreground/12 bg-foreground/[0.025] overflow-hidden">
                         <button
                           type="button"
                           onClick={() =>
                             setExpandedThinking((prev) => ({
                               ...prev,
-                              [msg.id]: !prev[msg.id],
+                              [msg.id]: !thinkingOpen,
                             }))
                           }
-                          className="min-h-[38px] inline-flex items-center gap-1.5 font-mono text-xs text-muted-foreground hover:text-foreground transition-colors"
+                          className="w-full min-h-[42px] px-3.5 py-2 flex items-center justify-between gap-2 font-mono text-xs font-semibold text-foreground/85 hover:text-foreground transition-colors text-left"
                         >
-                          {thinkingOpen ? (
-                            <ChevronDown className="w-3.5 h-3.5" />
-                          ) : (
-                            <ChevronRight className="w-3.5 h-3.5" />
-                          )}
-                          <span>
-                            {msg.isStreaming && !msg.content ? 'Thinking...' : 'Thought process'}
+                          <span className="inline-flex items-center gap-2">
+                            {msg.isStreaming && !msg.content ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0 text-muted-foreground" />
+                            ) : thinkingOpen ? (
+                              <ChevronDown className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
+                            ) : (
+                              <ChevronRight className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
+                            )}
+                            <span>
+                              {msg.isStreaming && !msg.content
+                                ? 'Thinking through your request'
+                                : 'Thought process'}
+                            </span>
+                            {activeThinkingSecs > 0 && (
+                              <span className="text-muted-foreground font-normal tabular-nums">
+                                · {activeThinkingSecs}s
+                              </span>
+                            )}
+                          </span>
+                          <span className="text-[11px] font-normal text-muted-foreground">
+                            {thinkingOpen ? 'Hide' : 'Show'}
                           </span>
                         </button>
                         {thinkingOpen && (
-                          <div className="mt-2 p-4 border border-foreground/10 bg-foreground/[0.02] font-mono text-xs leading-relaxed text-muted-foreground whitespace-pre-wrap">
-                            {msg.thinking}
+                          <div className="px-4 pb-3.5 pt-2 border-t border-foreground/10 font-mono text-xs leading-relaxed text-muted-foreground whitespace-pre-wrap">
+                            {msg.thinking || 'Planning structure and steps...'}
                           </div>
                         )}
                       </div>
@@ -1704,11 +2046,37 @@ export default function App() {
                         messageId={msg.id}
                         onOpenArtifact={handleOpenArtifact}
                       />
-                    ) : msg.isStreaming && !msg.thinking ? (
-                      <div className="py-2 font-mono text-xs text-muted-foreground">
-                        Writing...
-                      </div>
                     ) : null}
+
+                    {msg.interrupted && !msg.isStreaming && (
+                      <div className="p-3.5 rounded-2xl border border-foreground/20 bg-foreground/[0.03] flex flex-wrap items-center justify-between gap-3">
+                        <div className="text-xs font-semibold tracking-tight text-foreground">
+                          Paused before finishing — your request and progress were saved.
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleContinueInterruptedMessage(index)}
+                            className="min-h-[40px] px-4 rounded-full bg-foreground text-background text-xs font-semibold flex items-center gap-1.5 hover:bg-foreground/90 transition-colors"
+                          >
+                            <Play className="w-3.5 h-3.5 fill-current" />
+                            <span>
+                              {msg.content.trim() ? 'Continue building' : 'Run request now'}
+                            </span>
+                          </button>
+                          {msg.content.trim() && (
+                            <button
+                              type="button"
+                              onClick={() => handleRetryMessage(index)}
+                              className="min-h-[40px] px-3.5 rounded-full border border-foreground/20 hover:bg-foreground/5 text-xs font-semibold text-foreground flex items-center gap-1.5 transition-colors"
+                            >
+                              <RotateCcw className="w-3.5 h-3.5" />
+                              <span>Start over</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    )}
 
                     {msg.error && (
                       <div className="p-4 border border-destructive/40 bg-destructive/5 font-mono text-xs text-destructive">
@@ -1903,6 +2271,14 @@ export default function App() {
         customModels={activeKeyObj?.customModels || []}
         onAddCustomModels={handleAddCustomModels}
         onRemoveCustomModel={handleRemoveCustomModel}
+      />
+
+      {/* Install App Guide Modal (iOS Safari / Browser Fallback) */}
+      <InstallAppModal
+        isOpen={installModalOpen}
+        onClose={() => setInstallModalOpen(false)}
+        isIOS={isIOS}
+        isInIframe={isInIframe}
       />
     </div>
   );
