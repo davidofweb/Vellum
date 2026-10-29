@@ -1,4 +1,4 @@
-import { ModelOption } from '../types';
+import { BackgroundChatRunState, ModelOption } from '../types';
 
 export interface ChatPayloadMessage {
   role: 'system' | 'user' | 'assistant';
@@ -493,8 +493,21 @@ function shouldPreferResponsesEndpoint(model: string): boolean {
   return /codex/i.test(model);
 }
 
-function isFirewallErrorString(msg: string): boolean {
+export function isFirewallErrorString(msg: string): boolean {
   return /firewall|slider|aliyun_waf/i.test(msg);
+}
+
+export function isLocalOnlyBaseUrl(rawBaseUrl: string): boolean {
+  const host = getHostname(sanitizeBaseUrlInput(rawBaseUrl));
+  if (!host) return false;
+  return (
+    host === 'localhost' ||
+    host === '127.0.0.1' ||
+    host === '[::1]' ||
+    host.endsWith('.local') ||
+    /^192\.168\.\d+\.\d+$/.test(host) ||
+    /^10\.\d+\.\d+\.\d+$/.test(host)
+  );
 }
 
 function isEndpointMismatchError(status: number, message: string): boolean {
@@ -1758,4 +1771,187 @@ export async function streamChatFromGateway(params: {
     if (batchThinking) params.onThinking(batchThinking);
     if (batchContent) params.onContent(batchContent);
   }
+}
+
+export async function startBackgroundChatRun(params: {
+  runId: string;
+  workspaceId: string;
+  conversationId: string;
+  assistantMsgId: string;
+  baseUrl: string;
+  rawApiKey: string;
+  rawWafCookie?: string;
+  model: string;
+  messages: ChatPayloadMessage[];
+  systemPrompt?: string;
+  temperature?: number;
+  reasoningEffort?: ReasoningEffortMode;
+  initialContent?: string;
+  initialThinking?: string;
+  baseThinkingSeconds?: number;
+}): Promise<BackgroundChatRunState> {
+  const apiKey = sanitizeApiKey(params.rawApiKey);
+  const cleanBase = sanitizeBaseUrlInput(params.baseUrl);
+  const wafCookie = sanitizeWafCookie(params.rawWafCookie);
+
+  const bodyStr = JSON.stringify({
+    runId: params.runId,
+    workspaceId: params.workspaceId,
+    conversationId: params.conversationId,
+    assistantMsgId: params.assistantMsgId,
+    model: params.model,
+    messages: params.messages,
+    systemPrompt: params.systemPrompt,
+    temperature: params.temperature,
+    reasoningEffort: params.reasoningEffort,
+    initialContent: params.initialContent || '',
+    initialThinking: params.initialThinking || '',
+    baseThinkingSeconds: params.baseThinkingSeconds || 0,
+  });
+
+  const res = await fetch('/api/chat/runs', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-agentrouter-key': apiKey,
+      'x-agentrouter-base-url': cleanBase,
+      ...(wafCookie ? { 'x-agentrouter-cookie': wafCookie } : {}),
+    },
+    body: bodyStr,
+    // Keep initiation alive across tab close when payload fits browser keepalive limit
+    ...(bodyStr.length < 56000 ? { keepalive: true } : {}),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.run) {
+    throw new Error(String(data?.error || `Unable to start background run (${res.status})`));
+  }
+
+  return data.run as BackgroundChatRunState;
+}
+
+export async function fetchWorkspaceChatRuns(
+  workspaceId: string
+): Promise<BackgroundChatRunState[]> {
+  const res = await fetch(
+    `/api/chat/runs?workspaceId=${encodeURIComponent(workspaceId)}`,
+    {
+      headers: { Accept: 'application/json' },
+      cache: 'no-store',
+    }
+  );
+  if (!res.ok) return [];
+  const data = await res.json().catch(() => ({}));
+  return Array.isArray(data?.runs) ? (data.runs as BackgroundChatRunState[]) : [];
+}
+
+export async function fetchBackgroundChatRun(
+  runId: string
+): Promise<BackgroundChatRunState | null> {
+  const res = await fetch(`/api/chat/runs/${encodeURIComponent(runId)}`, {
+    headers: { Accept: 'application/json' },
+    cache: 'no-store',
+  });
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => ({}));
+  return data?.run ? (data.run as BackgroundChatRunState) : null;
+}
+
+export async function cancelBackgroundChatRun(
+  runId: string
+): Promise<BackgroundChatRunState | null> {
+  try {
+    const res = await fetch(`/api/chat/runs/${encodeURIComponent(runId)}/cancel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      keepalive: true,
+    });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => ({}));
+    return data?.run ? (data.run as BackgroundChatRunState) : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function subscribeToBackgroundChatRun(
+  runId: string,
+  callbacks: {
+    onSnapshot: (run: BackgroundChatRunState) => void;
+    onDelta: (delta: {
+      contentDelta: string;
+      thinkingDelta: string;
+      thinkingSeconds: number;
+    }) => void;
+    onFinished: (run: BackgroundChatRunState) => void;
+  },
+  signal: AbortSignal
+): Promise<'completed' | 'not_found'> {
+  const res = await fetch(`/api/chat/runs/${encodeURIComponent(runId)}/stream`, {
+    method: 'GET',
+    headers: { Accept: 'text/event-stream' },
+    cache: 'no-store',
+    signal,
+  });
+
+  if (res.status === 404) {
+    return 'not_found';
+  }
+
+  if (!res.ok || !res.body) {
+    throw new Error(`Stream connection dropped (${res.status})`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let sawTerminalEvent = false;
+
+  const handleLine = (rawLine: string) => {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) return;
+    const jsonStr = line.slice(5).trim();
+    if (!jsonStr) return;
+
+    let packet: Record<string, any>;
+    try {
+      packet = JSON.parse(jsonStr);
+    } catch {
+      return;
+    }
+
+    if (packet.type === 'snapshot' && packet.run) {
+      callbacks.onSnapshot(packet.run as BackgroundChatRunState);
+    } else if (packet.type === 'delta') {
+      callbacks.onDelta({
+        contentDelta: typeof packet.contentDelta === 'string' ? packet.contentDelta : '',
+        thinkingDelta: typeof packet.thinkingDelta === 'string' ? packet.thinkingDelta : '',
+        thinkingSeconds: Number(packet.thinkingSeconds) || 0,
+      });
+    } else if ((packet.type === 'done' || packet.type === 'finished') && packet.run) {
+      sawTerminalEvent = true;
+      callbacks.onFinished(packet.run as BackgroundChatRunState);
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || '';
+    for (const rawLine of lines) {
+      handleLine(rawLine);
+    }
+  }
+
+  if (buffer.trim()) {
+    handleLine(buffer);
+  }
+
+  if (!sawTerminalEvent) {
+    throw new Error('SSE stream ended before terminal run state.');
+  }
+
+  return 'completed';
 }

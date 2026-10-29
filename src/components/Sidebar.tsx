@@ -6,6 +6,7 @@ import {
   Copy,
   Download,
   KeyRound,
+  Loader2,
   Moon,
   Plus,
   Search,
@@ -261,6 +262,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 <div className="divide-y divide-foreground/10 border-t border-b border-foreground/10">
                   {filteredConversations.map((conv) => {
                     const isActive = conv.id === activeId;
+                    const isConvRunning = conv.messages.some((m) => m.isStreaming);
                     return (
                       <div
                         key={conv.id}
@@ -281,9 +283,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
                           <div className="text-sm font-medium truncate">
                             {conv.title || 'Untitled chat'}
                           </div>
-                          <div className="font-mono text-[11px] text-muted-foreground truncate tabular-nums mt-0.5">
-                            {formatShortDate(conv.updatedAt)} · {conv.messages.length}{' '}
-                            {conv.messages.length === 1 ? 'msg' : 'msgs'}
+                          <div className="font-mono text-[11px] text-muted-foreground truncate tabular-nums mt-0.5 flex items-center gap-1.5">
+                            {isConvRunning && (
+                              <>
+                                <span className="inline-flex items-center gap-1 text-foreground font-semibold">
+                                  <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                                  Running
+                                </span>
+                                <span aria-hidden="true">·</span>
+                              </>
+                            )}
+                            <span>
+                              {formatShortDate(conv.updatedAt)} · {conv.messages.length}{' '}
+                              {conv.messages.length === 1 ? 'msg' : 'msgs'}
+                            </span>
                           </div>
                         </button>
                         <button

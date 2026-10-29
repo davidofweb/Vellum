@@ -32,6 +32,7 @@ import {
   AgentRole,
   ArtifactItem,
   Attachment,
+  BackgroundChatRunState,
   ChatMessage,
   Conversation,
   InboundAgentTask,
@@ -43,12 +44,19 @@ import { BASE_API_PRESETS, BUILT_IN_ROLES, STARTER_PROMPTS } from './constants';
 import { extractArtifactsFromText } from './utils/artifacts';
 import {
   AGENTROUTER_OPENAI_MODELS,
+  cancelBackgroundChatRun,
+  fetchBackgroundChatRun,
   fetchCatalogFallbackModels,
+  fetchWorkspaceChatRuns,
   isAgentRouterMainHost,
+  isFirewallErrorString,
+  isLocalOnlyBaseUrl,
   sanitizeApiKey,
   sanitizeBaseUrlInput,
   sanitizeWafCookie,
+  startBackgroundChatRun,
   streamChatFromGateway,
+  subscribeToBackgroundChatRun,
   syncModelsFromGateway,
   testModelOnGateway,
 } from './utils/gateway';
@@ -82,15 +90,22 @@ function recoverSavedConversations(rawList: unknown): Conversation[] | null {
   return rawList.map((conv: Conversation) => ({
     ...conv,
     messages: Array.isArray(conv.messages)
-      ? conv.messages.map((m) =>
-          m.isStreaming
-            ? {
-                ...m,
-                isStreaming: false,
-                interrupted: true,
-              }
-            : m
-        )
+      ? conv.messages.map((m) => {
+          if (!m.isStreaming) return m;
+          // Keep backend-tracked runs in streaming state so startup sync seamlessly reattaches or loads finished output
+          if (m.runId) {
+            return {
+              ...m,
+              isStreaming: true,
+              interrupted: false,
+            };
+          }
+          return {
+            ...m,
+            isStreaming: false,
+            interrupted: true,
+          };
+        })
       : [],
   }));
 }
@@ -207,6 +222,17 @@ export default function App() {
     }
     return conversations[0]?.id || '';
   });
+  const activeConversation =
+    conversations.find((c) => c.id === activeId) || conversations[0];
+
+  const isStreaming = Boolean(
+    activeConversation?.messages.some((m) => m.isStreaming)
+  );
+  const anyConversationStreaming = useMemo(
+    () => conversations.some((c) => c.messages.some((m) => m.isStreaming)),
+    [conversations]
+  );
+
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(() =>
     typeof window !== 'undefined' ? window.innerWidth >= 1280 : false
   );
@@ -219,7 +245,6 @@ export default function App() {
     }
   });
   const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const [isStreaming, setIsStreaming] = useState(false);
   const [liveThinkingSec, setLiveThinkingSec] = useState(0);
   const [activeArtifact, setActiveArtifact] = useState<ArtifactItem | null>(null);
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
@@ -269,7 +294,9 @@ export default function App() {
   const [showInlineCookieField, setShowInlineCookieField] = useState(false);
   const [showInlineKey, setShowInlineKey] = useState(false);
 
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const localStreamControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const attachedRunStreamsRef = useRef<Map<string, AbortController>>(new Map());
+  const reconcilingRunsRef = useRef<boolean>(false);
   const speechSessionRef = useRef<number>(0);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -300,6 +327,9 @@ export default function App() {
       if (isSpeechSynthesisSupported()) {
         window.speechSynthesis.cancel();
       }
+      // Detach browser SSE listeners on unmount without cancelling backend runs
+      attachedRunStreamsRef.current.forEach((ctrl) => ctrl.abort());
+      attachedRunStreamsRef.current.clear();
     };
   }, []);
 
@@ -339,7 +369,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!isStreaming) {
+    if (!anyConversationStreaming) {
       persistConversationsSnapshot(conversations);
       return;
     }
@@ -354,7 +384,7 @@ export default function App() {
       persistConversationsSnapshot(conversationsRef.current);
     }, 700 - elapsed);
     return () => window.clearTimeout(timer);
-  }, [conversations, isStreaming, persistConversationsSnapshot]);
+  }, [conversations, anyConversationStreaming, persistConversationsSnapshot]);
 
   useEffect(() => {
     try {
@@ -823,9 +853,6 @@ export default function App() {
     };
   }, [workspaceId]);
 
-  const activeConversation =
-    conversations.find((c) => c.id === activeId) || conversations[0];
-
   const selectedRole =
     allRoles.find((r) => r.id === selectedRoleId) || BUILT_IN_ROLES[0];
 
@@ -924,133 +951,158 @@ export default function App() {
     setInstallModalOpen(true);
   }, [canPromptDirectly, promptInstallApp]);
 
-  const streamAgentResponse = useCallback(
-    async (
-      convId: string,
-      historyMessages: ChatMessage[],
-      modelToUse: string,
-      roleToUse: AgentRole,
-      userKey: SavedUserKey,
-      resumeTarget?: {
-        msgId: string;
-        existingContent: string;
-        existingThinking: string;
-        existingSeconds: number;
-      }
-    ) => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-      }
+  const applyRunStateToConversations = useCallback(
+    (run: BackgroundChatRunState) => {
+      setConversations((prev) => {
+        let changed = false;
+        const next = prev.map((c) => {
+          const hasMatchingMsg =
+            c.id === run.conversationId ||
+            c.messages.some(
+              (m) => m.runId === run.runId || m.id === run.assistantMsgId
+            );
+          if (!hasMatchingMsg) return c;
 
-      const controller = new AbortController();
-      abortControllerRef.current = controller;
+          const updatedMessages = c.messages.map((m) => {
+            if (m.runId !== run.runId && m.id !== run.assistantMsgId) return m;
+            changed = true;
+            const nextContent = run.content || m.content;
+            const nextThinking = run.thinking || m.thinking;
+            const nextSecs = run.thinkingSeconds || m.thinkingSeconds;
 
-      const assistantMsgId =
-        resumeTarget?.msgId || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-      const baseSeconds = resumeTarget?.existingSeconds || 0;
+            if (run.status === 'running') {
+              return {
+                ...m,
+                runId: run.runId,
+                content: nextContent,
+                thinking: nextThinking,
+                thinkingSeconds: nextSecs || undefined,
+                isStreaming: true,
+                interrupted: false,
+                error: undefined,
+              };
+            }
 
-      setIsStreaming(true);
-      setLiveThinkingSec(baseSeconds);
-      userScrolledUpRef.current = false;
+            if (run.status === 'done') {
+              return {
+                ...m,
+                runId: run.runId,
+                content: nextContent,
+                thinking: nextThinking,
+                thinkingSeconds: nextSecs || undefined,
+                isStreaming: false,
+                interrupted: false,
+                error: undefined,
+              };
+            }
 
-      if (resumeTarget) {
-        setConversations((prev) => {
-          const next = prev.map((c) =>
-            c.id === convId
-              ? {
-                  ...c,
-                  messages: c.messages.map((m) =>
-                    m.id === assistantMsgId
-                      ? {
-                          ...m,
-                          isStreaming: true,
-                          interrupted: false,
-                          error: undefined,
-                        }
-                      : m
-                  ),
-                  updatedAt: Date.now(),
-                }
-              : c
-          );
-          persistConversationsSnapshot(next);
-          return next;
+            if (run.status === 'cancelled') {
+              return {
+                ...m,
+                runId: run.runId,
+                content: nextContent,
+                thinking: nextThinking,
+                thinkingSeconds: nextSecs || undefined,
+                isStreaming: false,
+                interrupted: true,
+                error: undefined,
+              };
+            }
+
+            // status === 'failed'
+            const hasPartial = Boolean(
+              (nextContent || '').trim() || (nextThinking || '').trim()
+            );
+            return {
+              ...m,
+              runId: run.runId,
+              content: nextContent,
+              thinking: nextThinking,
+              thinkingSeconds: nextSecs || undefined,
+              isStreaming: false,
+              interrupted: hasPartial,
+              error: run.error || 'Something went wrong.',
+            };
+          });
+
+          return {
+            ...c,
+            messages: updatedMessages,
+            ...(run.status !== 'running' ? { updatedAt: run.updatedAt || Date.now() } : {}),
+          };
         });
-      } else {
-        const initialAssistantMessage: ChatMessage = {
-          id: assistantMsgId,
-          role: 'assistant',
-          content: '',
-          thinking: '',
-          thinkingSeconds: 0,
-          model: modelToUse,
-          createdAt: Date.now(),
-          isStreaming: true,
-          interrupted: false,
-        };
 
-        setConversations((prev) => {
-          const next = prev.map((c) =>
-            c.id === convId
-              ? {
-                  ...c,
-                  messages: [...historyMessages, initialAssistantMessage],
-                  updatedAt: Date.now(),
-                }
-              : c
-          );
+        if (!changed) return prev;
+        if (run.status !== 'running' || document.visibilityState === 'hidden') {
           persistConversationsSnapshot(next);
-          return next;
-        });
-      }
-
-      if (stickyScrollRef.current) {
-        requestAnimationFrame(() => scrollToBottom('smooth'));
-      }
-
-      const payloadMessages = historyMessages.map((m) => {
-        let fullText = m.content;
-        if (m.attachments && m.attachments.length > 0) {
-          const attBlocks = m.attachments
-            .map((a) => `--- File: ${a.name} ---\n${a.content}\n--- End File ---`)
-            .join('\n\n');
-          fullText = fullText ? `${attBlocks}\n\n${fullText}` : attBlocks;
         }
-        return {
-          role: m.role,
-          content: fullText,
-        };
+        return next;
       });
 
-      if (resumeTarget && resumeTarget.existingContent.trim()) {
-        payloadMessages.push({
-          role: 'assistant',
-          content: resumeTarget.existingContent,
-        });
-        payloadMessages.push({
-          role: 'user',
-          content:
-            'Continue directly from the exact character where your previous output stopped. Do not repeat earlier code or text; finish the remaining output cleanly.',
-        });
+      if (
+        run.status === 'done' &&
+        run.conversationId === activeIdRef.current &&
+        typeof window !== 'undefined' &&
+        window.innerWidth >= 1280
+      ) {
+        const extracted = extractArtifactsFromText(run.assistantMsgId, run.content);
+        const firstPreviewable = extracted.find((a) => a.previewable);
+        if (firstPreviewable) {
+          setActiveArtifact((curr) => curr || firstPreviewable);
+        }
       }
+    },
+    [persistConversationsSnapshot]
+  );
+
+  const runDirectBrowserStreamFallback = useCallback(
+    async (params: {
+      convId: string;
+      assistantMsgId: string;
+      payloadMessages: { role: 'system' | 'user' | 'assistant'; content: string }[];
+      modelToUse: string;
+      roleToUse: AgentRole;
+      userKey: SavedUserKey;
+      baseContent: string;
+      baseThinking: string;
+      baseSeconds: number;
+    }) => {
+      const {
+        convId,
+        assistantMsgId,
+        payloadMessages,
+        modelToUse,
+        roleToUse,
+        userKey,
+        baseContent,
+        baseThinking,
+        baseSeconds,
+      } = params;
+
+      localStreamControllersRef.current.get(convId)?.abort();
+      const controller = new AbortController();
+      localStreamControllersRef.current.set(convId, controller);
 
       let rafId: number | null = null;
       let bgTimerId: number | null = null;
-      let accumulatedContent = resumeTarget?.existingContent || '';
-      let accumulatedThinking = resumeTarget?.existingThinking || '';
+      let accumulatedContent = baseContent;
+      let accumulatedThinking = baseThinking;
       const startedThinkingAt = Date.now();
       let recordedThinkingSec = baseSeconds;
-      let hasStartedContent = Boolean(resumeTarget?.existingContent);
+      let hasStartedContent = Boolean(baseContent.trim());
 
       const tickInterval = window.setInterval(() => {
         if (!hasStartedContent) {
-          const sec = baseSeconds + Math.max(1, Math.round((Date.now() - startedThinkingAt) / 1000));
+          const sec =
+            baseSeconds + Math.max(1, Math.round((Date.now() - startedThinkingAt) / 1000));
           recordedThinkingSec = sec;
-          setLiveThinkingSec(sec);
+          if (convId === activeIdRef.current) {
+            setLiveThinkingSec(sec);
+          }
         }
       }, 1000);
 
-      const commitStreamState = (done = false, interrupted = false) => {
+      const commitLocalState = (done = false, interrupted = false) => {
         setConversations((prev) => {
           const next = prev.map((c) =>
             c.id === convId
@@ -1060,6 +1112,7 @@ export default function App() {
                     m.id === assistantMsgId
                       ? {
                           ...m,
+                          runId: undefined,
                           content: accumulatedContent,
                           thinking: accumulatedThinking,
                           thinkingSeconds: recordedThinkingSec || undefined,
@@ -1067,8 +1120,9 @@ export default function App() {
                             ? {
                                 isStreaming: false,
                                 interrupted,
+                                error: undefined,
                               }
-                            : {}),
+                            : { isStreaming: true, error: undefined }),
                         }
                       : m
                   ),
@@ -1099,14 +1153,14 @@ export default function App() {
           if (bgTimerId !== null) return;
           bgTimerId = window.setTimeout(() => {
             bgTimerId = null;
-            commitStreamState(false);
+            commitLocalState(false);
           }, 220);
           return;
         }
         if (rafId !== null) return;
         rafId = requestAnimationFrame(() => {
           rafId = null;
-          commitStreamState(false);
+          commitLocalState(false);
         });
       };
 
@@ -1116,7 +1170,9 @@ export default function App() {
             hasStartedContent = true;
             recordedThinkingSec =
               baseSeconds + Math.max(1, Math.round((Date.now() - startedThinkingAt) / 1000));
-            setLiveThinkingSec(recordedThinkingSec);
+            if (convId === activeIdRef.current) {
+              setLiveThinkingSec(recordedThinkingSec);
+            }
           }
           accumulatedContent += cleanDelta;
           scheduleStreamFlush();
@@ -1142,11 +1198,13 @@ export default function App() {
           temperature: roleToUse.temperature,
           reasoningEffort: fastReplies ? 'low' : 'medium',
           signal: controller.signal,
-          onContent: (delta) => {
-            splitter.pushContent(delta);
-          },
+          onContent: (delta) => splitter.pushContent(delta),
           onThinking: (delta) => {
-            if (accumulatedThinking && !accumulatedThinking.endsWith('\n') && delta.startsWith('-')) {
+            if (
+              accumulatedThinking &&
+              !accumulatedThinking.endsWith('\n') &&
+              delta.startsWith('-')
+            ) {
               splitter.pushNativeThinking(`\n${delta}`);
             } else {
               splitter.pushNativeThinking(delta);
@@ -1156,18 +1214,18 @@ export default function App() {
 
         splitter.flush();
         cancelPendingFlush();
-        commitStreamState(true, false);
+        commitLocalState(true, false);
 
-        const extracted = extractArtifactsFromText(assistantMsgId, accumulatedContent);
-        const firstPreviewable = extracted.find((a) => a.previewable);
-        if (firstPreviewable && window.innerWidth >= 1280) {
-          setActiveArtifact(firstPreviewable);
+        if (convId === activeIdRef.current && window.innerWidth >= 1280) {
+          const extracted = extractArtifactsFromText(assistantMsgId, accumulatedContent);
+          const firstPreviewable = extracted.find((a) => a.previewable);
+          if (firstPreviewable) setActiveArtifact(firstPreviewable);
         }
       } catch (err: unknown) {
         splitter.flush();
         cancelPendingFlush();
         if (controller.signal.aborted) {
-          commitStreamState(true, true);
+          commitLocalState(true, true);
         } else {
           const message = err instanceof Error ? err.message : 'Something went wrong.';
           const hasPartialProgress = Boolean(
@@ -1182,6 +1240,7 @@ export default function App() {
                       m.id === assistantMsgId
                         ? {
                             ...m,
+                            runId: undefined,
                             content: accumulatedContent,
                             thinking: accumulatedThinking,
                             thinkingSeconds: recordedThinkingSec || undefined,
@@ -1201,11 +1260,497 @@ export default function App() {
         }
       } finally {
         window.clearInterval(tickInterval);
-        setIsStreaming(false);
-        abortControllerRef.current = null;
+        if (localStreamControllersRef.current.get(convId) === controller) {
+          localStreamControllersRef.current.delete(convId);
+        }
       }
     },
-    [scrollToBottom, fastReplies, persistConversationsSnapshot]
+    [fastReplies, persistConversationsSnapshot]
+  );
+
+  const attachToBackgroundRun = useCallback(
+    (
+      convId: string,
+      assistantMsgId: string,
+      runId: string,
+      firewallFallback?: () => Promise<void>
+    ) => {
+      if (attachedRunStreamsRef.current.has(runId)) {
+        return;
+      }
+
+      const sseController = new AbortController();
+      attachedRunStreamsRef.current.set(runId, sseController);
+
+      let rafId: number | null = null;
+      let bgTimerId: number | null = null;
+      let accumulatedContent = '';
+      let accumulatedThinking = '';
+      let recordedThinkingSec = 0;
+
+      const cancelPendingFlush = () => {
+        if (rafId !== null) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+        if (bgTimerId !== null) {
+          window.clearTimeout(bgTimerId);
+          bgTimerId = null;
+        }
+      };
+
+      const commitLiveProgress = () => {
+        if (convId === activeIdRef.current && recordedThinkingSec > 0) {
+          setLiveThinkingSec(recordedThinkingSec);
+        }
+        setConversations((prev) => {
+          const next = prev.map((c) =>
+            c.id === convId
+              ? {
+                  ...c,
+                  messages: c.messages.map((m) =>
+                    m.runId === runId || m.id === assistantMsgId
+                      ? {
+                          ...m,
+                          runId,
+                          content: accumulatedContent,
+                          thinking: accumulatedThinking,
+                          thinkingSeconds: recordedThinkingSec || m.thinkingSeconds,
+                          isStreaming: true,
+                          interrupted: false,
+                          error: undefined,
+                        }
+                      : m
+                  ),
+                }
+              : c
+          );
+          if (document.visibilityState === 'hidden') {
+            persistConversationsSnapshot(next);
+          }
+          return next;
+        });
+      };
+
+      const scheduleLiveFlush = () => {
+        if (document.visibilityState === 'hidden') {
+          if (bgTimerId !== null) return;
+          bgTimerId = window.setTimeout(() => {
+            bgTimerId = null;
+            commitLiveProgress();
+          }, 250);
+          return;
+        }
+        if (rafId !== null) return;
+        rafId = requestAnimationFrame(() => {
+          rafId = null;
+          commitLiveProgress();
+        });
+      };
+
+      let usedFirewallFallback = false;
+
+      void (async () => {
+        try {
+          const outcome = await subscribeToBackgroundChatRun(
+            runId,
+            {
+              onSnapshot: (run) => {
+                accumulatedContent = run.content || '';
+                accumulatedThinking = run.thinking || '';
+                recordedThinkingSec = run.thinkingSeconds || 0;
+                cancelPendingFlush();
+                commitLiveProgress();
+              },
+              onDelta: ({ contentDelta, thinkingDelta, thinkingSeconds }) => {
+                if (contentDelta) accumulatedContent += contentDelta;
+                if (thinkingDelta) accumulatedThinking += thinkingDelta;
+                if (thinkingSeconds > 0) {
+                  recordedThinkingSec = thinkingSeconds;
+                  if (convId === activeIdRef.current && !contentDelta && !thinkingDelta) {
+                    setLiveThinkingSec(thinkingSeconds);
+                    return;
+                  }
+                }
+                scheduleLiveFlush();
+              },
+              onFinished: (run) => {
+                cancelPendingFlush();
+                if (
+                  run.status === 'failed' &&
+                  !run.content.trim() &&
+                  isFirewallErrorString(run.error || '') &&
+                  firewallFallback &&
+                  document.visibilityState === 'visible'
+                ) {
+                  usedFirewallFallback = true;
+                  return;
+                }
+                applyRunStateToConversations(run);
+              },
+            },
+            sseController.signal
+          );
+
+          if (usedFirewallFallback && firewallFallback) {
+            await firewallFallback();
+            return;
+          }
+
+          if (outcome === 'not_found') {
+            setConversations((prev) => {
+              const next = prev.map((c) =>
+                c.id === convId
+                  ? {
+                      ...c,
+                      messages: c.messages.map((m) =>
+                        m.runId === runId || m.id === assistantMsgId
+                          ? {
+                              ...m,
+                              isStreaming: false,
+                              interrupted: true,
+                            }
+                          : m
+                      ),
+                    }
+                  : c
+              );
+              persistConversationsSnapshot(next);
+              return next;
+            });
+          }
+        } catch {
+          cancelPendingFlush();
+          // If the browser tab went into mobile background suspension or Wi-Fi blipped,
+          // the backend job is STILL running! Never mark failed — reconcile when visible.
+          if (!sseController.signal.aborted && document.visibilityState === 'visible') {
+            window.setTimeout(async () => {
+              try {
+                const latest = await fetchBackgroundChatRun(runId);
+                if (!latest) return;
+                if (latest.status === 'running') {
+                  attachToBackgroundRun(convId, assistantMsgId, runId);
+                } else {
+                  applyRunStateToConversations(latest);
+                }
+              } catch {
+                // Will reconcile automatically on focus / online / visibilitychange
+              }
+            }, 1200);
+          }
+        } finally {
+          if (attachedRunStreamsRef.current.get(runId) === sseController) {
+            attachedRunStreamsRef.current.delete(runId);
+          }
+        }
+      })();
+    },
+    [applyRunStateToConversations, persistConversationsSnapshot]
+  );
+
+  const reconcileWorkspaceRuns = useCallback(async () => {
+    if (reconcilingRunsRef.current) return;
+    const hasTrackedMessages = conversationsRef.current.some((c) =>
+      c.messages.some((m) => Boolean(m.runId) && (m.isStreaming || m.interrupted))
+    );
+    if (!hasTrackedMessages) return;
+
+    reconcilingRunsRef.current = true;
+    try {
+      const serverRuns = await fetchWorkspaceChatRuns(workspaceId);
+      const runsById = new Map(serverRuns.map((r) => [r.runId, r]));
+
+      const missingStreamingTargets: Array<{ convId: string; msgId: string; runId: string }> =
+        [];
+
+      for (const conv of conversationsRef.current) {
+        for (const msg of conv.messages) {
+          if (!msg.runId) continue;
+          const serverRun = runsById.get(msg.runId);
+          if (serverRun) {
+            const shouldApply =
+              msg.isStreaming ||
+              (serverRun.status === 'done' &&
+                (msg.interrupted || serverRun.content.length > msg.content.length)) ||
+              serverRun.content.length > msg.content.length;
+
+            if (shouldApply) {
+              applyRunStateToConversations(serverRun);
+            }
+            if (serverRun.status === 'running') {
+              attachToBackgroundRun(conv.id, msg.id, serverRun.runId);
+            }
+          } else if (msg.isStreaming) {
+            missingStreamingTargets.push({
+              convId: conv.id,
+              msgId: msg.id,
+              runId: msg.runId,
+            });
+          }
+        }
+      }
+
+      for (const missing of missingStreamingTargets) {
+        const directCheck = await fetchBackgroundChatRun(missing.runId);
+        if (directCheck) {
+          applyRunStateToConversations(directCheck);
+          if (directCheck.status === 'running') {
+            attachToBackgroundRun(missing.convId, missing.msgId, directCheck.runId);
+          }
+        } else {
+          setConversations((prev) => {
+            const next = prev.map((c) =>
+              c.id === missing.convId
+                ? {
+                    ...c,
+                    messages: c.messages.map((m) =>
+                      m.id === missing.msgId
+                        ? {
+                            ...m,
+                            isStreaming: false,
+                            interrupted: true,
+                          }
+                        : m
+                    ),
+                  }
+                : c
+            );
+            persistConversationsSnapshot(next);
+            return next;
+          });
+        }
+      }
+    } catch {
+      // Ignore transient offline sync errors; will retry on online / focus
+    } finally {
+      reconcilingRunsRef.current = false;
+    }
+  }, [
+    workspaceId,
+    applyRunStateToConversations,
+    attachToBackgroundRun,
+    persistConversationsSnapshot,
+  ]);
+
+  useEffect(() => {
+    void reconcileWorkspaceRuns();
+
+    const handleVisibleSync = () => {
+      if (document.visibilityState === 'visible') {
+        void reconcileWorkspaceRuns();
+      }
+    };
+
+    const handleResumeSync = () => {
+      void reconcileWorkspaceRuns();
+    };
+
+    document.addEventListener('visibilitychange', handleVisibleSync);
+    window.addEventListener('pageshow', handleResumeSync);
+    window.addEventListener('focus', handleResumeSync);
+    window.addEventListener('online', handleResumeSync);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibleSync);
+      window.removeEventListener('pageshow', handleResumeSync);
+      window.removeEventListener('focus', handleResumeSync);
+      window.removeEventListener('online', handleResumeSync);
+    };
+  }, [reconcileWorkspaceRuns]);
+
+  const streamAgentResponse = useCallback(
+    async (
+      convId: string,
+      historyMessages: ChatMessage[],
+      modelToUse: string,
+      roleToUse: AgentRole,
+      userKey: SavedUserKey,
+      resumeTarget?: {
+        msgId: string;
+        existingContent: string;
+        existingThinking: string;
+        existingSeconds: number;
+      }
+    ) => {
+      const assistantMsgId =
+        resumeTarget?.msgId || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+      const baseSeconds = resumeTarget?.existingSeconds || 0;
+      const baseContent = resumeTarget?.existingContent || '';
+      const baseThinking = resumeTarget?.existingThinking || '';
+      const useLocalOnly = isLocalOnlyBaseUrl(userKey.baseUrl);
+      const runId = useLocalOnly
+        ? undefined
+        : `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+      setLiveThinkingSec(baseSeconds);
+      userScrolledUpRef.current = false;
+
+      if (resumeTarget) {
+        setConversations((prev) => {
+          const next = prev.map((c) =>
+            c.id === convId
+              ? {
+                  ...c,
+                  messages: c.messages.map((m) =>
+                    m.id === assistantMsgId
+                      ? {
+                          ...m,
+                          runId,
+                          isStreaming: true,
+                          interrupted: false,
+                          error: undefined,
+                        }
+                      : m
+                  ),
+                  updatedAt: Date.now(),
+                }
+              : c
+          );
+          persistConversationsSnapshot(next);
+          return next;
+        });
+      } else {
+        const initialAssistantMessage: ChatMessage = {
+          id: assistantMsgId,
+          role: 'assistant',
+          content: '',
+          thinking: '',
+          thinkingSeconds: 0,
+          model: modelToUse,
+          createdAt: Date.now(),
+          isStreaming: true,
+          interrupted: false,
+          runId,
+        };
+
+        setConversations((prev) => {
+          const next = prev.map((c) =>
+            c.id === convId
+              ? {
+                  ...c,
+                  messages: [...historyMessages, initialAssistantMessage],
+                  updatedAt: Date.now(),
+                }
+              : c
+          );
+          persistConversationsSnapshot(next);
+          return next;
+        });
+      }
+
+      if (stickyScrollRef.current) {
+        requestAnimationFrame(() => scrollToBottom('smooth'));
+      }
+
+      const payloadMessages: { role: 'system' | 'user' | 'assistant'; content: string }[] =
+        historyMessages.map((m) => {
+          let fullText = m.content;
+          if (m.attachments && m.attachments.length > 0) {
+            const attBlocks = m.attachments
+              .map((a) => `--- File: ${a.name} ---\n${a.content}\n--- End File ---`)
+              .join('\n\n');
+            fullText = fullText ? `${attBlocks}\n\n${fullText}` : attBlocks;
+          }
+          return {
+            role: m.role,
+            content: fullText,
+          };
+        });
+
+      if (resumeTarget && baseContent.trim()) {
+        payloadMessages.push({
+          role: 'assistant',
+          content: baseContent,
+        });
+        payloadMessages.push({
+          role: 'user',
+          content:
+            'Continue directly from the exact character where your previous output stopped. Do not repeat earlier code or text; finish the remaining output cleanly.',
+        });
+      }
+
+      if (useLocalOnly || !runId) {
+        await runDirectBrowserStreamFallback({
+          convId,
+          assistantMsgId,
+          payloadMessages,
+          modelToUse,
+          roleToUse,
+          userKey,
+          baseContent,
+          baseThinking,
+          baseSeconds,
+        });
+        return;
+      }
+
+      try {
+        await startBackgroundChatRun({
+          runId,
+          workspaceId,
+          conversationId: convId,
+          assistantMsgId,
+          baseUrl: userKey.baseUrl,
+          rawApiKey: userKey.apiKey,
+          rawWafCookie: userKey.wafCookie,
+          model: modelToUse,
+          messages: payloadMessages,
+          systemPrompt: withThinkingInstruction(roleToUse.instructions),
+          temperature: roleToUse.temperature,
+          reasoningEffort: fastReplies ? 'low' : 'medium',
+          initialContent: baseContent,
+          initialThinking: baseThinking,
+          baseThinkingSeconds: baseSeconds,
+        });
+
+        attachToBackgroundRun(convId, assistantMsgId, runId, () =>
+          runDirectBrowserStreamFallback({
+            convId,
+            assistantMsgId,
+            payloadMessages,
+            modelToUse,
+            roleToUse,
+            userKey,
+            baseContent,
+            baseThinking,
+            baseSeconds,
+          })
+        );
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : 'Unable to start request.';
+        setConversations((prev) => {
+          const next = prev.map((c) =>
+            c.id === convId
+              ? {
+                  ...c,
+                  messages: c.messages.map((m) =>
+                    m.id === assistantMsgId
+                      ? {
+                          ...m,
+                          runId: undefined,
+                          isStreaming: false,
+                          interrupted: Boolean(baseContent.trim() || baseThinking.trim()),
+                          error: message,
+                        }
+                      : m
+                  ),
+                  updatedAt: Date.now(),
+                }
+              : c
+          );
+          persistConversationsSnapshot(next);
+          return next;
+        });
+      }
+    },
+    [
+      workspaceId,
+      fastReplies,
+      scrollToBottom,
+      persistConversationsSnapshot,
+      attachToBackgroundRun,
+      runDirectBrowserStreamFallback,
+    ]
   );
 
   const handleSend = useCallback(
@@ -1262,7 +1807,7 @@ export default function App() {
         setAttachments([]);
       }
 
-      streamAgentResponse(
+      void streamAgentResponse(
         activeConversation.id,
         nextMessages,
         selectedModel,
@@ -1283,12 +1828,46 @@ export default function App() {
   );
 
   const handleStop = () => {
-    abortControllerRef.current?.abort();
+    if (!activeConversation) return;
+    localStreamControllersRef.current.get(activeConversation.id)?.abort();
+
+    const runningMessages = activeConversation.messages.filter((m) => m.isStreaming);
+    for (const msg of runningMessages) {
+      if (msg.runId) {
+        attachedRunStreamsRef.current.get(msg.runId)?.abort();
+        attachedRunStreamsRef.current.delete(msg.runId);
+        void cancelBackgroundChatRun(msg.runId);
+      }
+    }
+
+    if (runningMessages.length > 0) {
+      setConversations((prev) => {
+        const next = prev.map((c) =>
+          c.id === activeConversation.id
+            ? {
+                ...c,
+                messages: c.messages.map((m) =>
+                  m.isStreaming
+                    ? {
+                        ...m,
+                        isStreaming: false,
+                        interrupted: true,
+                      }
+                    : m
+                ),
+                updatedAt: Date.now(),
+              }
+            : c
+        );
+        persistConversationsSnapshot(next);
+        return next;
+      });
+    }
   };
 
   const handleNewChat = () => {
     stopSpeaking();
-    if (isStreaming) abortControllerRef.current?.abort();
+    // Existing chats continue running in the backend while you start a new chat
     const blank = createBlankConversation(selectedModel, selectedRoleId);
     setConversations((prev) => [blank, ...prev]);
     setActiveId(blank.id);
@@ -1300,6 +1879,17 @@ export default function App() {
   const handleDeleteConversation = (id: string) => {
     if (id === activeConversation?.id) {
       stopSpeaking();
+    }
+    localStreamControllersRef.current.get(id)?.abort();
+    const targetConv = conversations.find((c) => c.id === id);
+    if (targetConv) {
+      for (const m of targetConv.messages) {
+        if (m.isStreaming && m.runId) {
+          attachedRunStreamsRef.current.get(m.runId)?.abort();
+          attachedRunStreamsRef.current.delete(m.runId);
+          void cancelBackgroundChatRun(m.runId);
+        }
+      }
     }
     setConversations((prev) => {
       const remaining = prev.filter((c) => c.id !== id);
@@ -1534,6 +2124,7 @@ export default function App() {
         activeId={activeConversation?.id || ''}
         onSelectConversation={(id) => {
           stopSpeaking();
+          setLiveThinkingSec(0);
           setActiveId(id);
           setActiveArtifact(null);
         }}
@@ -1997,7 +2588,7 @@ export default function App() {
                     key={msg.id}
                     className="space-y-3.5 pb-6 border-b border-foreground/10 last:border-b-0"
                   >
-                    {(msg.thinking || (msg.isStreaming && !msg.content)) && (
+                    {(msg.thinking || msg.isStreaming) && (
                       <div className="rounded-2xl border border-foreground/12 bg-foreground/[0.025] overflow-hidden">
                         <button
                           type="button"
@@ -2009,8 +2600,8 @@ export default function App() {
                           }
                           className="w-full min-h-[42px] px-3.5 py-2 flex items-center justify-between gap-2 font-mono text-xs font-semibold text-foreground/85 hover:text-foreground transition-colors text-left"
                         >
-                          <span className="inline-flex items-center gap-2">
-                            {msg.isStreaming && !msg.content ? (
+                          <span className="inline-flex flex-wrap items-center gap-2 min-w-0">
+                            {msg.isStreaming ? (
                               <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0 text-muted-foreground" />
                             ) : thinkingOpen ? (
                               <ChevronDown className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
@@ -2027,14 +2618,22 @@ export default function App() {
                                 · {activeThinkingSecs}s
                               </span>
                             )}
+                            {msg.isStreaming && msg.runId && (
+                              <span className="text-[11px] font-normal text-muted-foreground hidden sm:inline">
+                                · Continues in background if closed
+                              </span>
+                            )}
                           </span>
-                          <span className="text-[11px] font-normal text-muted-foreground">
+                          <span className="text-[11px] font-normal text-muted-foreground shrink-0">
                             {thinkingOpen ? 'Hide' : 'Show'}
                           </span>
                         </button>
                         {thinkingOpen && (
                           <div className="px-4 pb-3.5 pt-2 border-t border-foreground/10 font-mono text-xs leading-relaxed text-muted-foreground whitespace-pre-wrap">
-                            {msg.thinking || 'Planning structure and steps...'}
+                            {msg.thinking ||
+                              (msg.isStreaming && msg.runId
+                                ? 'Running in the background — keeps going even if you close the app.'
+                                : 'Planning structure and steps...')}
                           </div>
                         )}
                       </div>

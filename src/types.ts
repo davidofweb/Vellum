@@ -25,6 +25,22 @@ export interface ChatMessage {
   error?: string;
   isStreaming?: boolean;
   interrupted?: boolean;
+  runId?: string;
+}
+
+export interface BackgroundChatRunState {
+  runId: string;
+  workspaceId: string;
+  conversationId: string;
+  assistantMsgId: string;
+  model: string;
+  status: 'running' | 'done' | 'failed' | 'cancelled';
+  content: string;
+  thinking: string;
+  thinkingSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+  error?: string;
 }
 
 export interface Conversation {

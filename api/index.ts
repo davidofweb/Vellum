@@ -1,6 +1,9 @@
 import 'dotenv/config';
 import express from 'express';
 import type { Request, Response } from 'express';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 interface ChatMessagePayload {
   role: 'system' | 'user' | 'assistant';
@@ -43,6 +46,278 @@ interface CachedServerRoute {
 }
 const upstreamRouteCache = new Map<string, CachedServerRoute>();
 const unsupportedServerReasoningCache = new Set<string>();
+
+interface PersistedChatRunRecord {
+  runId: string;
+  workspaceId: string;
+  conversationId: string;
+  assistantMsgId: string;
+  model: string;
+  status: 'running' | 'done' | 'failed' | 'cancelled';
+  content: string;
+  thinking: string;
+  thinkingSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+  error?: string;
+}
+
+interface ActiveChatRunEntry {
+  record: PersistedChatRunRecord;
+  subscribers: Set<Response>;
+  abortController: AbortController | null;
+}
+
+const CHAT_RUNS_FILE = path.join(os.tmpdir(), 'vellum-chat-runs-v1.json');
+const MAX_STORED_RUNS = 120;
+const chatRunsById = new Map<string, ActiveChatRunEntry>();
+let runsLoadedFromDisk = false;
+let persistRunsTimer: ReturnType<typeof setTimeout> | null = null;
+let persistRunsInFlight = false;
+let persistRunsPending = false;
+
+function ensureChatRunsLoaded() {
+  if (runsLoadedFromDisk) return;
+  runsLoadedFromDisk = true;
+  try {
+    if (!fs.existsSync(CHAT_RUNS_FILE)) return;
+    const raw = fs.readFileSync(CHAT_RUNS_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return;
+    for (const item of parsed) {
+      if (!item || typeof item !== 'object' || typeof item.runId !== 'string') continue;
+      const rec = item as PersistedChatRunRecord;
+      const normalizedStatus = rec.status === 'running' ? 'cancelled' : rec.status;
+      chatRunsById.set(rec.runId, {
+        record: {
+          ...rec,
+          status: normalizedStatus,
+          content: String(rec.content || ''),
+          thinking: String(rec.thinking || ''),
+          thinkingSeconds: Number(rec.thinkingSeconds) || 0,
+        },
+        subscribers: new Set(),
+        abortController: null,
+      });
+    }
+  } catch {
+    // Ignore corrupt or missing temp store
+  }
+}
+
+function pruneOldChatRuns() {
+  if (chatRunsById.size <= MAX_STORED_RUNS) return;
+  const entries = Array.from(chatRunsById.values()).sort(
+    (a, b) => a.record.updatedAt - b.record.updatedAt
+  );
+  for (const entry of entries) {
+    if (chatRunsById.size <= MAX_STORED_RUNS) break;
+    if (entry.record.status === 'running') continue;
+    chatRunsById.delete(entry.record.runId);
+  }
+}
+
+async function flushChatRunsToDisk() {
+  if (persistRunsInFlight) {
+    persistRunsPending = true;
+    return;
+  }
+  persistRunsInFlight = true;
+  try {
+    pruneOldChatRuns();
+    const records = Array.from(chatRunsById.values()).map((e) => e.record);
+    const tmpFile = `${CHAT_RUNS_FILE}.tmp`;
+    await fs.promises.writeFile(tmpFile, JSON.stringify(records), 'utf8');
+    await fs.promises.rename(tmpFile, CHAT_RUNS_FILE);
+  } catch {
+    // Ignore transient temp file errors
+  } finally {
+    persistRunsInFlight = false;
+    if (persistRunsPending) {
+      persistRunsPending = false;
+      void flushChatRunsToDisk();
+    }
+  }
+}
+
+function schedulePersistChatRuns(immediate = false) {
+  if (immediate) {
+    if (persistRunsTimer) {
+      clearTimeout(persistRunsTimer);
+      persistRunsTimer = null;
+    }
+    void flushChatRunsToDisk();
+    return;
+  }
+  if (persistRunsTimer) return;
+  persistRunsTimer = setTimeout(() => {
+    persistRunsTimer = null;
+    void flushChatRunsToDisk();
+  }, 850);
+}
+
+function broadcastRunPacket(entry: ActiveChatRunEntry, packet: Record<string, unknown>, closeAfter = false) {
+  if (entry.subscribers.size === 0) return;
+  const frame = `data: ${JSON.stringify(packet)}\n\n`;
+  for (const sub of Array.from(entry.subscribers)) {
+    try {
+      if (!sub.writableEnded) {
+        sub.write(frame);
+        if (closeAfter) {
+          sub.end();
+        }
+      }
+      if (closeAfter) {
+        entry.subscribers.delete(sub);
+      }
+    } catch {
+      entry.subscribers.delete(sub);
+    }
+  }
+}
+
+function registerRuntimeWaitUntil(promise: Promise<unknown>) {
+  try {
+    const sym = Symbol.for('@vercel/request-context');
+    const ctx = (globalThis as Record<symbol, any>)[sym]?.get?.();
+    if (ctx && typeof ctx.waitUntil === 'function') {
+      ctx.waitUntil(promise);
+    }
+  } catch {
+    // Standard persistent Node runtime needs no waitUntil hook
+  }
+}
+
+function createServerThinkSplitter(callbacks: {
+  onContent: (delta: string) => void;
+  onThinking: (delta: string) => void;
+  hasInitialThinking?: boolean;
+  hasInitialContent?: boolean;
+}) {
+  let state: 'initial' | 'in_think' | 'content' = callbacks.hasInitialContent ? 'content' : 'initial';
+  let pending = '';
+  let activeCloseTag = '</think>';
+  let hasEmittedThinking = Boolean(callbacks.hasInitialThinking);
+  let strippedLeadingAfterThink = Boolean(callbacks.hasInitialContent);
+
+  const emitThinking = (text: string) => {
+    if (!text) return;
+    if (!hasEmittedThinking) {
+      const cleaned = text.replace(/^\s+/, '');
+      if (!cleaned) return;
+      hasEmittedThinking = true;
+      callbacks.onThinking(cleaned);
+      return;
+    }
+    callbacks.onThinking(text);
+  };
+
+  const emitContent = (text: string) => {
+    if (!text) return;
+    if (!strippedLeadingAfterThink) {
+      const cleaned = text.replace(/^\r?\n+/, '');
+      if (!cleaned) return;
+      strippedLeadingAfterThink = true;
+      callbacks.onContent(cleaned);
+      return;
+    }
+    callbacks.onContent(text);
+  };
+
+  const processPending = (finalFlush = false) => {
+    while (pending.length > 0) {
+      if (state === 'initial') {
+        const trimmedStart = pending.replace(/^\s+/, '');
+        if (!trimmedStart) {
+          if (finalFlush) {
+            strippedLeadingAfterThink = true;
+            emitContent(pending);
+            pending = '';
+          }
+          return;
+        }
+
+        const lower = trimmedStart.toLowerCase();
+        if (lower.startsWith('<thinking>')) {
+          const idx = pending.toLowerCase().indexOf('<thinking>');
+          pending = pending.slice(idx + '<thinking>'.length);
+          activeCloseTag = '</thinking>';
+          state = 'in_think';
+          continue;
+        }
+        if (lower.startsWith('<think>')) {
+          const idx = pending.toLowerCase().indexOf('<think>');
+          pending = pending.slice(idx + '<think>'.length);
+          activeCloseTag = '</think>';
+          state = 'in_think';
+          continue;
+        }
+
+        if (!finalFlush && ('<thinking>'.startsWith(lower) || '<think>'.startsWith(lower))) {
+          return;
+        }
+
+        strippedLeadingAfterThink = true;
+        state = 'content';
+        emitContent(pending);
+        pending = '';
+        return;
+      }
+
+      if (state === 'in_think') {
+        const lower = pending.toLowerCase();
+        const closeIdx = lower.indexOf(activeCloseTag);
+        if (closeIdx !== -1) {
+          const thoughtPart = pending.slice(0, closeIdx);
+          emitThinking(thoughtPart);
+          pending = pending.slice(closeIdx + activeCloseTag.length);
+          state = 'content';
+          continue;
+        }
+
+        if (finalFlush) {
+          emitThinking(pending);
+          pending = '';
+          return;
+        }
+
+        let holdBack = 0;
+        const maxHold = Math.min(pending.length, activeCloseTag.length - 1);
+        for (let len = maxHold; len >= 1; len--) {
+          if (activeCloseTag.startsWith(lower.slice(-len))) {
+            holdBack = len;
+            break;
+          }
+        }
+
+        const safeLen = pending.length - holdBack;
+        if (safeLen > 0) {
+          emitThinking(pending.slice(0, safeLen));
+          pending = pending.slice(safeLen);
+        }
+        return;
+      }
+
+      emitContent(pending);
+      pending = '';
+    }
+  };
+
+  return {
+    pushContent(chunk: string) {
+      if (!chunk) return;
+      pending += chunk;
+      processPending(false);
+    },
+    pushNativeThinking(chunk: string) {
+      if (!chunk) return;
+      emitThinking(chunk);
+    },
+    flush() {
+      processPending(true);
+    },
+  };
+}
 
 const BROWSER_USER_AGENT =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -1096,6 +1371,18 @@ async function openUpstreamStream(params: {
   // If agentrouter.org hit datacenter firewall on Cloud Run, jump straight to co.agentrouter.org/v1
   if (isAgentRouterMainHost(baseUrl)) {
     try {
+      if (preferResponsesFirst) {
+        const coRespUrl = 'https://co.agentrouter.org/v1/responses';
+        const coResp = await sendResponsesAt(coRespUrl, 0);
+        if (coResp) {
+          upstreamRouteCache.set(routeKey, {
+            protocol: 'openai-responses',
+            endpointUrl: coRespUrl,
+            profileIdx: 0,
+          });
+          return { response: coResp, protocol: 'openai-responses' };
+        }
+      }
       const coChatUrl = 'https://co.agentrouter.org/v1/chat/completions';
       const coRes = await sendChatCompletionAt(coChatUrl, 0);
       if (coRes) {
@@ -1788,6 +2075,298 @@ app.use(express.json({ limit: '4mb' }));
       sendEvent('error', { message });
       res.end();
     }
+  });
+
+  // 3b. Detached Background Chat Run Engine (continues executing even when browser/app is closed)
+  app.post('/api/chat/runs', async (req: Request, res: Response) => {
+    ensureChatRunsLoaded();
+
+    const apiKey = extractRequestApiKey(req);
+    const baseUrl = extractRequestBaseUrl(req);
+    const wafCookie = extractRequestWafCookie(req);
+
+    if (!baseUrl) {
+      res.status(400).json({ error: 'Add and save your Base API URL first.' });
+      return;
+    }
+    if (!apiKey) {
+      res.status(401).json({ error: 'Add and save your API key first.' });
+      return;
+    }
+
+    const {
+      runId: rawRunId,
+      workspaceId: rawWorkspaceId,
+      conversationId: rawConversationId,
+      assistantMsgId: rawAssistantMsgId,
+      model,
+      messages,
+      systemPrompt,
+      temperature,
+      maxTokens,
+      reasoningEffort,
+      initialContent = '',
+      initialThinking = '',
+      baseThinkingSeconds = 0,
+    } = req.body || {};
+
+    const selectedModel = String(model || '').trim();
+    if (!selectedModel) {
+      res.status(400).json({ error: 'Sync and select a model before sending a message.' });
+      return;
+    }
+    if (!Array.isArray(messages) || messages.length === 0) {
+      res.status(400).json({ error: 'Please write a message first.' });
+      return;
+    }
+
+    const runId =
+      String(rawRunId || '').trim() ||
+      `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const existing = chatRunsById.get(runId);
+    if (existing) {
+      res.status(200).json({ run: existing.record });
+      return;
+    }
+
+    const now = Date.now();
+    const startBaseSec = Math.max(0, Number(baseThinkingSeconds) || 0);
+    const seedContent = typeof initialContent === 'string' ? initialContent : '';
+    const seedThinking = typeof initialThinking === 'string' ? initialThinking : '';
+
+    const abortController = new AbortController();
+    const entry: ActiveChatRunEntry = {
+      record: {
+        runId,
+        workspaceId: String(rawWorkspaceId || 'default').trim(),
+        conversationId: String(rawConversationId || '').trim(),
+        assistantMsgId: String(rawAssistantMsgId || '').trim(),
+        model: selectedModel,
+        status: 'running',
+        content: seedContent,
+        thinking: seedThinking,
+        thinkingSeconds: startBaseSec,
+        createdAt: now,
+        updatedAt: now,
+      },
+      subscribers: new Set(),
+      abortController,
+    };
+
+    chatRunsById.set(runId, entry);
+    schedulePersistChatRuns(true);
+
+    const runPromise = (async () => {
+      const startedThinkingAt = Date.now();
+      let hasStartedContent = Boolean(seedContent.trim());
+
+      const updateThinkingClock = () => {
+        if (!hasStartedContent) {
+          entry.record.thinkingSeconds =
+            startBaseSec + Math.max(1, Math.round((Date.now() - startedThinkingAt) / 1000));
+        }
+      };
+
+      const clockInterval = setInterval(() => {
+        if (entry.record.status !== 'running' || hasStartedContent) return;
+        updateThinkingClock();
+        broadcastRunPacket(entry, {
+          type: 'delta',
+          contentDelta: '',
+          thinkingDelta: '',
+          thinkingSeconds: entry.record.thinkingSeconds,
+        });
+      }, 1000);
+
+      const splitter = createServerThinkSplitter({
+        hasInitialContent: Boolean(seedContent),
+        hasInitialThinking: Boolean(seedThinking),
+        onContent: (cleanDelta) => {
+          if (!hasStartedContent && cleanDelta.trim()) {
+            updateThinkingClock();
+            hasStartedContent = true;
+          }
+          entry.record.content += cleanDelta;
+          entry.record.updatedAt = Date.now();
+          broadcastRunPacket(entry, {
+            type: 'delta',
+            contentDelta: cleanDelta,
+            thinkingDelta: '',
+            thinkingSeconds: entry.record.thinkingSeconds,
+          });
+          schedulePersistChatRuns(false);
+        },
+        onThinking: (cleanThought) => {
+          updateThinkingClock();
+          entry.record.thinking += cleanThought;
+          entry.record.updatedAt = Date.now();
+          broadcastRunPacket(entry, {
+            type: 'delta',
+            contentDelta: '',
+            thinkingDelta: cleanThought,
+            thinkingSeconds: entry.record.thinkingSeconds,
+          });
+          schedulePersistChatRuns(false);
+        },
+      });
+
+      try {
+        const { response: upstream, protocol } = await openUpstreamStream({
+          apiKey,
+          baseUrl,
+          wafCookie,
+          model: selectedModel,
+          messages,
+          systemPrompt,
+          temperature,
+          maxTokens,
+          reasoningEffort: reasoningEffort === 'low' ? 'low' : 'medium',
+          signal: abortController.signal,
+        });
+
+        await consumeAgentRouterStream(upstream, protocol, {
+          onContent: (chunk) => {
+            splitter.pushContent(chunk);
+          },
+          onThinking: (chunk) => {
+            if (
+              entry.record.thinking &&
+              !entry.record.thinking.endsWith('\n') &&
+              chunk.startsWith('-')
+            ) {
+              splitter.pushNativeThinking(`\n${chunk}`);
+            } else {
+              splitter.pushNativeThinking(chunk);
+            }
+          },
+        });
+
+        splitter.flush();
+        entry.record.status = 'done';
+        entry.record.updatedAt = Date.now();
+        entry.abortController = null;
+        schedulePersistChatRuns(true);
+        broadcastRunPacket(entry, { type: 'done', run: entry.record }, true);
+      } catch (err: unknown) {
+        splitter.flush();
+        entry.abortController = null;
+        entry.record.updatedAt = Date.now();
+        if (abortController.signal.aborted || entry.record.status === 'cancelled') {
+          entry.record.status = 'cancelled';
+        } else {
+          entry.record.status = 'failed';
+          entry.record.error =
+            err instanceof Error ? err.message : 'Background request failed.';
+        }
+        schedulePersistChatRuns(true);
+        broadcastRunPacket(entry, { type: 'finished', run: entry.record }, true);
+      } finally {
+        clearInterval(clockInterval);
+      }
+    })();
+
+    registerRuntimeWaitUntil(runPromise);
+    res.status(202).json({ run: entry.record });
+  });
+
+  app.get('/api/chat/runs', (req: Request, res: Response) => {
+    ensureChatRunsLoaded();
+    const workspaceId = String(req.query.workspaceId || '').trim();
+    const rawRunIds = String(req.query.runIds || '').trim();
+    const filterIds = rawRunIds
+      ? new Set(
+          rawRunIds
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean)
+        )
+      : null;
+
+    const runs: PersistedChatRunRecord[] = [];
+    for (const entry of chatRunsById.values()) {
+      if (filterIds && !filterIds.has(entry.record.runId)) continue;
+      if (workspaceId && !filterIds && entry.record.workspaceId !== workspaceId) continue;
+      runs.push(entry.record);
+    }
+    runs.sort((a, b) => b.updatedAt - a.updatedAt);
+    res.json({ runs });
+  });
+
+  app.get('/api/chat/runs/:runId', (req: Request, res: Response) => {
+    ensureChatRunsLoaded();
+    const entry = chatRunsById.get(String(req.params.runId || '').trim());
+    if (!entry) {
+      res.status(404).json({ error: 'Run not found.' });
+      return;
+    }
+    res.json({ run: entry.record });
+  });
+
+  app.get('/api/chat/runs/:runId/stream', (req: Request, res: Response) => {
+    ensureChatRunsLoaded();
+    const entry = chatRunsById.get(String(req.params.runId || '').trim());
+    if (!entry) {
+      res.status(404).json({ error: 'Run not found.' });
+      return;
+    }
+
+    req.socket?.setNoDelay?.(true);
+    res.socket?.setNoDelay?.(true);
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders?.();
+
+    res.write(`data: ${JSON.stringify({ type: 'snapshot', run: entry.record })}\n\n`);
+
+    if (entry.record.status !== 'running') {
+      const terminalType = entry.record.status === 'done' ? 'done' : 'finished';
+      res.write(`data: ${JSON.stringify({ type: terminalType, run: entry.record })}\n\n`);
+      res.end();
+      return;
+    }
+
+    entry.subscribers.add(res);
+
+    const keepAlive = setInterval(() => {
+      try {
+        if (!res.writableEnded) {
+          res.write(': ping\n\n');
+        }
+      } catch {
+        clearInterval(keepAlive);
+        entry.subscribers.delete(res);
+      }
+    }, 15000);
+
+    // Detach only this browser listener on close — never abort the running backend job!
+    res.on('close', () => {
+      clearInterval(keepAlive);
+      entry.subscribers.delete(res);
+    });
+  });
+
+  app.post('/api/chat/runs/:runId/cancel', (req: Request, res: Response) => {
+    ensureChatRunsLoaded();
+    const entry = chatRunsById.get(String(req.params.runId || '').trim());
+    if (!entry) {
+      res.status(404).json({ error: 'Run not found.' });
+      return;
+    }
+
+    if (entry.record.status === 'running') {
+      entry.record.status = 'cancelled';
+      entry.record.updatedAt = Date.now();
+      entry.abortController?.abort();
+      entry.abortController = null;
+      schedulePersistChatRuns(true);
+      broadcastRunPacket(entry, { type: 'finished', run: entry.record }, true);
+    }
+
+    res.json({ run: entry.record });
   });
 
   // 4. Per-Workspace Inbound Agent Requests Receiver & SSE Feed
