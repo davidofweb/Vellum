@@ -348,9 +348,12 @@ const OPENAI_CLIENT_PROFILES: Record<string, string>[] = [
 
 function sanitizeApiKey(raw: string): string {
   return raw
+    .replace(/[\u200B-\u200D\uFEFF\u2060]/g, '')
     .trim()
-    .replace(/^bearer\s+/i, '')
-    .replace(/^['"`]+|['"`]+$/g, '')
+    .replace(/^(authorization\s*:\s*)?bearer\s+/i, '')
+    .replace(/^x-api-key\s*:\s*/i, '')
+    .replace(/^['"`“”‘’]+|['"`“”‘’]+$/g, '')
+    .replace(/\s+/g, '')
     .trim();
 }
 
@@ -616,7 +619,7 @@ function parseErrorMessage(raw: string, status: number, contentType = '', target
       return 'Endpoint not found (HTTP 404). Check your Base API URL.';
     }
     if (isAgentRouterMainHost(targetUrl)) {
-      return 'Temporary firewall check on agentrouter.org. Open agentrouter.org once in a browser tab to clear the slider, wait 30 seconds, then retry — or switch Base API to co.agentrouter.org/v1.';
+      return 'Temporary firewall check on agentrouter.org. Open agentrouter.org once in a browser tab to clear the slider, wait 30 seconds, then retry.';
     }
     return 'Temporary web firewall check on this domain. Open your Base API site once in a browser tab to clear verification, then retry.';
   }
@@ -922,9 +925,12 @@ function shouldPreferResponsesEndpoint(model: string): boolean {
 }
 
 function isEndpointMismatchError(status: number, message: string): boolean {
-  if (status === 404 || status === 405) return true;
+  if (status === 401 || status === 402 || status === 403 || status === 429) {
+    return false;
+  }
+  if (status === 404 || status === 405 || status >= 500) return true;
   if (status === 400 || status === 422) {
-    return /responses|endpoint|messages|wire_api|not supported on this|only supported in|v1\/responses|v1\/messages/i.test(
+    return /responses|endpoint|messages|wire_api|channel|无可用渠道|not supported|only supported|unsupported|v1\/responses|v1\/messages/i.test(
       message
     );
   }
@@ -1368,34 +1374,58 @@ async function openUpstreamStream(params: {
     );
   }
 
-  // If agentrouter.org hit datacenter firewall on Cloud Run, jump straight to co.agentrouter.org/v1
-  if (isAgentRouterMainHost(baseUrl)) {
+  // Only probe co.agentrouter.org when agentrouter.org hit datacenter WAF or returned 401,
+  // and ALWAYS restore the original agentrouter.org error if co.agentrouter.org rejects the key!
+  if (isAgentRouterMainHost(baseUrl) && (hitFirewall || mainHostCoolingDown || lastStatus === 401)) {
+    const savedError = lastError;
+    const savedStatus = lastStatus;
+    const savedFirewall = hitFirewall;
+
     try {
-      if (preferResponsesFirst) {
-        const coRespUrl = 'https://co.agentrouter.org/v1/responses';
-        const coResp = await sendResponsesAt(coRespUrl, 0);
-        if (coResp) {
-          upstreamRouteCache.set(routeKey, {
-            protocol: 'openai-responses',
-            endpointUrl: coRespUrl,
-            profileIdx: 0,
-          });
-          return { response: coResp, protocol: 'openai-responses' };
+      const coEndpoints: Array<{ protocol: 'openai-responses' | 'openai-chat'; url: string }> =
+        preferResponsesFirst
+          ? [
+              { protocol: 'openai-responses', url: 'https://co.agentrouter.org/v1/responses' },
+              { protocol: 'openai-chat', url: 'https://co.agentrouter.org/v1/chat/completions' },
+            ]
+          : [
+              { protocol: 'openai-chat', url: 'https://co.agentrouter.org/v1/chat/completions' },
+              { protocol: 'openai-responses', url: 'https://co.agentrouter.org/v1/responses' },
+            ];
+
+      for (const candidate of coEndpoints) {
+        if (candidate.protocol === 'openai-responses') {
+          const coResp = await sendResponsesAt(candidate.url, 0);
+          if (coResp) {
+            upstreamRouteCache.set(routeKey, {
+              protocol: 'openai-responses',
+              endpointUrl: candidate.url,
+              profileIdx: 0,
+            });
+            return { response: coResp, protocol: 'openai-responses' };
+          }
+        } else {
+          const coRes = await sendChatCompletionAt(candidate.url, 0);
+          if (coRes) {
+            upstreamRouteCache.set(routeKey, {
+              protocol: 'openai-chat',
+              endpointUrl: candidate.url,
+              profileIdx: 0,
+            });
+            return { response: coRes, protocol: 'openai-chat' };
+          }
         }
-      }
-      const coChatUrl = 'https://co.agentrouter.org/v1/chat/completions';
-      const coRes = await sendChatCompletionAt(coChatUrl, 0);
-      if (coRes) {
-        upstreamRouteCache.set(routeKey, {
-          protocol: 'openai-chat',
-          endpointUrl: coChatUrl,
-          profileIdx: 0,
-        });
-        return { response: coRes, protocol: 'openai-chat' };
+        if (lastStatus === 401 || lastStatus === 403) {
+          break;
+        }
       }
     } catch (err: unknown) {
       if (signal.aborted) throw err;
     }
+
+    lastError = savedError;
+    lastStatus = savedStatus;
+    hitFirewall = savedFirewall;
   }
 
   throw new Error(lastError);

@@ -48,7 +48,9 @@ import {
   fetchBackgroundChatRun,
   fetchCatalogFallbackModels,
   fetchWorkspaceChatRuns,
+  isAgentRouterFamilyHost,
   isAgentRouterMainHost,
+  isAuthKeyErrorString,
   isFirewallErrorString,
   isLocalOnlyBaseUrl,
   sanitizeApiKey,
@@ -1083,6 +1085,22 @@ export default function App() {
       const controller = new AbortController();
       localStreamControllersRef.current.set(convId, controller);
 
+      // Clear detached runId immediately so background reconciliation never overwrites active browser fallback
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === convId
+            ? {
+                ...c,
+                messages: c.messages.map((m) =>
+                  m.id === assistantMsgId
+                    ? { ...m, runId: undefined, isStreaming: true, error: undefined }
+                    : m
+                ),
+              }
+            : c
+        )
+      );
+
       let rafId: number | null = null;
       let bgTimerId: number | null = null;
       let accumulatedContent = baseContent;
@@ -1376,13 +1394,14 @@ export default function App() {
               },
               onFinished: (run) => {
                 cancelPendingFlush();
-                if (
+                const errText = run.error || '';
+                const shouldFallbackToBrowser =
                   run.status === 'failed' &&
                   !run.content.trim() &&
-                  isFirewallErrorString(run.error || '') &&
-                  firewallFallback &&
-                  document.visibilityState === 'visible'
-                ) {
+                  Boolean(firewallFallback) &&
+                  (isFirewallErrorString(errText) || isAuthKeyErrorString(errText));
+
+                if (shouldFallbackToBrowser) {
                   usedFirewallFallback = true;
                   return;
                 }
@@ -1464,6 +1483,7 @@ export default function App() {
         [];
 
       for (const conv of conversationsRef.current) {
+        if (localStreamControllersRef.current.has(conv.id)) continue;
         for (const msg of conv.messages) {
           if (!msg.runId) continue;
           const serverRun = runsById.get(msg.runId);
@@ -1684,15 +1704,26 @@ export default function App() {
         return;
       }
 
+      const effectiveBaseUrl =
+        syncedSourceUrl &&
+        isAgentRouterFamilyHost(userKey.baseUrl) &&
+        isAgentRouterFamilyHost(syncedSourceUrl)
+          ? syncedSourceUrl
+          : userKey.baseUrl;
+      const effectiveUserKey: SavedUserKey =
+        effectiveBaseUrl !== userKey.baseUrl
+          ? { ...userKey, baseUrl: effectiveBaseUrl }
+          : userKey;
+
       try {
         await startBackgroundChatRun({
           runId,
           workspaceId,
           conversationId: convId,
           assistantMsgId,
-          baseUrl: userKey.baseUrl,
-          rawApiKey: userKey.apiKey,
-          rawWafCookie: userKey.wafCookie,
+          baseUrl: effectiveUserKey.baseUrl,
+          rawApiKey: effectiveUserKey.apiKey,
+          rawWafCookie: effectiveUserKey.wafCookie,
           model: modelToUse,
           messages: payloadMessages,
           systemPrompt: withThinkingInstruction(roleToUse.instructions),
@@ -1710,7 +1741,7 @@ export default function App() {
             payloadMessages,
             modelToUse,
             roleToUse,
-            userKey,
+            userKey: effectiveUserKey,
             baseContent,
             baseThinking,
             baseSeconds,
@@ -1746,6 +1777,7 @@ export default function App() {
     [
       workspaceId,
       fastReplies,
+      syncedSourceUrl,
       scrollToBottom,
       persistConversationsSnapshot,
       attachToBackgroundRun,
@@ -2678,8 +2710,37 @@ export default function App() {
                     )}
 
                     {msg.error && (
-                      <div className="p-4 border border-destructive/40 bg-destructive/5 font-mono text-xs text-destructive">
-                        {msg.error}
+                      <div className="p-4 border border-destructive/40 bg-destructive/5 flex flex-wrap items-center justify-between gap-3">
+                        <div className="space-y-1 min-w-0 flex-1">
+                          <div className="font-mono text-xs font-semibold text-destructive break-words">
+                            {msg.error}
+                          </div>
+                          {isAuthKeyErrorString(msg.error) && (
+                            <p className="text-xs text-muted-foreground leading-relaxed">
+                              Make sure your API key matches your selected Base API URL (keys from agentrouter.org and co.agentrouter.org are separate) and has no extra characters.
+                            </p>
+                          )}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2 shrink-0">
+                          {isAuthKeyErrorString(msg.error) && (
+                            <button
+                              type="button"
+                              onClick={() => openKeyModelsModal('keys')}
+                              className="min-h-[38px] px-3.5 rounded-full bg-foreground text-background text-xs font-semibold flex items-center gap-1.5 hover:bg-foreground/90 transition-colors"
+                            >
+                              <KeyRound className="w-3.5 h-3.5" />
+                              <span>Check API Key</span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleRetryMessage(index)}
+                            className="min-h-[38px] px-3.5 rounded-full border border-foreground/20 hover:bg-foreground/5 text-xs font-semibold text-foreground flex items-center gap-1.5 transition-colors"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span>Retry</span>
+                          </button>
+                        </div>
                       </div>
                     )}
 

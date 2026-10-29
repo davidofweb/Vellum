@@ -29,9 +29,12 @@ export const AGENTROUTER_OPENAI_MODELS: ModelOption[] = [
 
 export function sanitizeApiKey(raw: string): string {
   return raw
+    .replace(/[\u200B-\u200D\uFEFF\u2060]/g, '')
     .trim()
-    .replace(/^bearer\s+/i, '')
-    .replace(/^['"`]+|['"`]+$/g, '')
+    .replace(/^(authorization\s*:\s*)?bearer\s+/i, '')
+    .replace(/^x-api-key\s*:\s*/i, '')
+    .replace(/^['"`“”‘’]+|['"`“”‘’]+$/g, '')
+    .replace(/\s+/g, '')
     .trim();
 }
 
@@ -76,6 +79,21 @@ function getHostname(urlStr: string): string {
 export function isAgentRouterMainHost(urlStr: string): boolean {
   const host = getHostname(urlStr);
   return host === 'agentrouter.org' || host === 'www.agentrouter.org';
+}
+
+export function isAgentRouterFamilyHost(urlStr: string): boolean {
+  const host = getHostname(urlStr);
+  return (
+    host === 'agentrouter.org' ||
+    host === 'www.agentrouter.org' ||
+    host === 'co.agentrouter.org'
+  );
+}
+
+export function isAuthKeyErrorString(msg: string): boolean {
+  return /invalid api key|incorrect api key|invalid token|unauthorized|authentication|无效的令牌|未提供令牌/i.test(
+    msg
+  );
 }
 
 function getBrowserSpoofHeadersForUrl(urlStr: string): Record<string, string> {
@@ -207,7 +225,7 @@ export function parseGatewayErrorText(
     }
     const host = getHostname(targetUrl) || targetUrl.replace(/^https?:\/\//i, '').split('/')[0];
     if (host === 'agentrouter.org' || host === 'www.agentrouter.org') {
-      return 'Temporary firewall check on agentrouter.org. Open agentrouter.org once in a browser tab to clear the slider, wait 30 seconds, then retry — or switch Base API to co.agentrouter.org/v1.';
+      return 'Temporary firewall check on agentrouter.org. Open agentrouter.org once in a browser tab to clear the slider, wait 30 seconds, then retry.';
     }
     const hostHint = host ? ` on ${host}` : '';
     return `Temporary web firewall check${hostHint}. Open the site once in a browser tab to clear verification, then retry.`;
@@ -511,9 +529,12 @@ export function isLocalOnlyBaseUrl(rawBaseUrl: string): boolean {
 }
 
 function isEndpointMismatchError(status: number, message: string): boolean {
-  if (status === 404 || status === 405) return true;
+  if (status === 401 || status === 402 || status === 403 || status === 429) {
+    return false;
+  }
+  if (status === 404 || status === 405 || status >= 500) return true;
   if (status === 400 || status === 422) {
-    return /responses|endpoint|messages|wire_api|not supported on this|only supported in|v1\/responses|v1\/messages/i.test(
+    return /responses|endpoint|messages|wire_api|channel|无可用渠道|not supported|only supported|unsupported|v1\/responses|v1\/messages/i.test(
       message
     );
   }
@@ -775,12 +796,8 @@ export async function syncModelsFromGateway(
     }
   }
 
-  if (definitiveAuthError) {
-    throw new Error(definitiveAuthError);
-  }
-
+  // Cross-check sibling AgentRouter domain before treating 401 or 0-model response as final
   if (isAgentRouterMainHost(cleanBase)) {
-    // Check co.agentrouter.org/v1/models once in case the key belongs to that endpoint
     try {
       const coCtrl = new AbortController();
       const coTimer = setTimeout(() => coCtrl.abort(), 6000);
@@ -815,12 +832,54 @@ export async function syncModelsFromGateway(
       // Ignore co.agentrouter.org check errors
     }
 
+    if (definitiveAuthError) {
+      throw new Error(definitiveAuthError);
+    }
+
     // Return 0 models here so syncModelsForKey runs its /api/pricing & /api/available_models fallback next
     return {
       models: [],
       sourceUrl: directConnectedBase || v1Urls[0],
       gatewayMessage: directGatewayNotice,
     };
+  }
+
+  if (getHostname(cleanBase) === 'co.agentrouter.org' && definitiveAuthError) {
+    try {
+      const arCtrl = new AbortController();
+      const arTimer = setTimeout(() => arCtrl.abort(), 6500);
+      const arRes = await fetch('https://agentrouter.org/v1/models', {
+        method: 'GET',
+        mode: 'cors',
+        credentials: 'omit',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          Accept: 'application/json',
+          ...getBrowserSpoofHeadersForUrl('https://agentrouter.org/v1'),
+        },
+        signal: arCtrl.signal,
+      });
+      clearTimeout(arTimer);
+      const arCt = arRes.headers.get('content-type') || '';
+      const arText = await arRes.text().catch(() => '');
+      if (arRes.ok && arText && !isHtmlFirewallOrPage(arCt, arText)) {
+        const arJson = JSON.parse(arText);
+        if (!extractGatewayErrorFromJson(arJson)) {
+          const { models: arModels, gatewayMessage: arMsg } = extractModelsFromPayload(arJson);
+          return {
+            models: arModels.length > 0 ? arModels : AGENTROUTER_OPENAI_MODELS.map((m) => ({ ...m })),
+            sourceUrl: 'https://agentrouter.org/v1',
+            gatewayMessage: arMsg,
+          };
+        }
+      }
+    } catch {
+      // Ignore sibling check failure
+    }
+  }
+
+  if (definitiveAuthError) {
+    throw new Error(definitiveAuthError);
   }
 
   // Backend proxy (/api/models) for /v1/models when browser had CORS/transport block
@@ -1233,31 +1292,65 @@ async function openDirectBrowserStream(params: {
     }
   }
 
-  // If agentrouter.org hit a temporary firewall check on the phone IP, try co.agentrouter.org/v1 once
-  if (state.hitFirewallMsg && isAgentRouterMainHost(baseUrl)) {
+  // Cross-check sibling AgentRouter domain in browser if primary hit firewall or 401 key mismatch,
+  // while preserving the original error if the sibling also rejects the request.
+  const isMainAr = isAgentRouterMainHost(baseUrl);
+  const isCoAr = getHostname(baseUrl) === 'co.agentrouter.org';
+  const hadAuthMismatch = state.lastJsonError?.status === 401;
+
+  if ((isMainAr && (state.hitFirewallMsg || hadAuthMismatch)) || (isCoAr && hadAuthMismatch)) {
     const savedFirewallMsg = state.hitFirewallMsg;
     const savedJsonError = state.lastJsonError;
+    state.hitFirewallMsg = null;
+    state.lastJsonError = null;
+
+    const siblingBase = isMainAr ? 'https://co.agentrouter.org/v1' : 'https://agentrouter.org/v1';
+    const siblingRespUrl = `${siblingBase}/responses`;
+
     if (preferResponsesFirst) {
-      const coHit = await tryOpenAiResponses(['https://co.agentrouter.org/v1/responses']);
-      if (coHit) {
+      const sibResp = await tryOpenAiResponses([siblingRespUrl]);
+      if (sibResp) {
         return {
           kind: 'ok',
-          response: coHit.response,
+          response: sibResp.response,
           protocol: 'openai-responses',
-          endpointUrl: coHit.endpointUrl,
+          endpointUrl: sibResp.endpointUrl,
         };
+      }
+      if (shouldTrySecondaryProtocol()) {
+        const sibChat = await tryOpenAiChat([siblingBase]);
+        if (sibChat) {
+          return {
+            kind: 'ok',
+            response: sibChat.response,
+            protocol: 'openai-chat',
+            endpointUrl: sibChat.endpointUrl,
+          };
+        }
       }
     } else {
-      const coHit = await tryOpenAiChat(['https://co.agentrouter.org/v1']);
-      if (coHit) {
+      const sibChat = await tryOpenAiChat([siblingBase]);
+      if (sibChat) {
         return {
           kind: 'ok',
-          response: coHit.response,
+          response: sibChat.response,
           protocol: 'openai-chat',
-          endpointUrl: coHit.endpointUrl,
+          endpointUrl: sibChat.endpointUrl,
         };
       }
+      if (shouldTrySecondaryProtocol()) {
+        const sibResp = await tryOpenAiResponses([siblingRespUrl]);
+        if (sibResp) {
+          return {
+            kind: 'ok',
+            response: sibResp.response,
+            protocol: 'openai-responses',
+            endpointUrl: sibResp.endpointUrl,
+          };
+        }
+      }
     }
+
     state.hitFirewallMsg = savedFirewallMsg;
     state.lastJsonError = savedJsonError;
   }
