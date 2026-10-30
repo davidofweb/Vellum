@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import express from 'express';
 import type { Request, Response } from 'express';
 import fs from 'node:fs';
@@ -396,6 +397,307 @@ function extractRequestWafCookie(req: Request): string {
 
   return '';
 }
+
+type SharedLinkEffectiveStatus = 'active' | 'revoked' | 'expired' | 'exhausted';
+
+interface StoredKeyShareRecord {
+  shareId: string;
+  ownerTokenHash: string;
+  label: string;
+  baseUrl: string;
+  apiKey: string;
+  wafCookie?: string;
+  customModels?: string[];
+  status: 'active' | 'revoked';
+  createdAt: number;
+  expiresAt: number | null;
+  maxMessages: number | null;
+  usedMessages: number;
+  lastUsedAt: number | null;
+}
+
+interface PublicShareSummary {
+  shareId: string;
+  label: string;
+  status: 'active' | 'revoked';
+  effectiveStatus: SharedLinkEffectiveStatus;
+  hostHint: string;
+  customModels: string[];
+  createdAt: number;
+  expiresAt: number | null;
+  maxMessages: number | null;
+  usedMessages: number;
+  lastUsedAt: number | null;
+}
+
+const KEY_SHARES_FILE = path.join(os.tmpdir(), 'vellum-key-shares-v1.json');
+const MAX_STORED_SHARES = 300;
+const keySharesById = new Map<string, StoredKeyShareRecord>();
+let sharesLoadedFromDisk = false;
+let persistSharesTimer: ReturnType<typeof setTimeout> | null = null;
+let persistSharesInFlight = false;
+let persistSharesPending = false;
+
+function ensureKeySharesLoaded() {
+  if (sharesLoadedFromDisk) return;
+  sharesLoadedFromDisk = true;
+  try {
+    if (!fs.existsSync(KEY_SHARES_FILE)) return;
+    const raw = fs.readFileSync(KEY_SHARES_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return;
+    for (const item of parsed) {
+      if (
+        !item ||
+        typeof item !== 'object' ||
+        typeof item.shareId !== 'string' ||
+        typeof item.ownerTokenHash !== 'string' ||
+        typeof item.apiKey !== 'string' ||
+        typeof item.baseUrl !== 'string'
+      ) {
+        continue;
+      }
+      keySharesById.set(item.shareId, {
+        shareId: item.shareId,
+        ownerTokenHash: item.ownerTokenHash,
+        label: String(item.label || 'Shared Link'),
+        baseUrl: item.baseUrl,
+        apiKey: item.apiKey,
+        ...(typeof item.wafCookie === 'string' && item.wafCookie ? { wafCookie: item.wafCookie } : {}),
+        customModels: Array.isArray(item.customModels)
+          ? item.customModels.map((m: unknown) => String(m || '').trim()).filter(Boolean)
+          : [],
+        status: item.status === 'revoked' ? 'revoked' : 'active',
+        createdAt: Number(item.createdAt) || Date.now(),
+        expiresAt: typeof item.expiresAt === 'number' ? item.expiresAt : null,
+        maxMessages: typeof item.maxMessages === 'number' ? item.maxMessages : null,
+        usedMessages: Math.max(0, Number(item.usedMessages) || 0),
+        lastUsedAt: typeof item.lastUsedAt === 'number' ? item.lastUsedAt : null,
+      });
+    }
+  } catch {
+    // Ignore missing or unreadable temp share store
+  }
+}
+
+function pruneOldKeyShares() {
+  if (keySharesById.size <= MAX_STORED_SHARES) return;
+  const sorted = Array.from(keySharesById.values()).sort((a, b) => a.createdAt - b.createdAt);
+  for (const item of sorted) {
+    if (keySharesById.size <= MAX_STORED_SHARES) break;
+    keySharesById.delete(item.shareId);
+  }
+}
+
+async function flushKeySharesToDisk() {
+  if (persistSharesInFlight) {
+    persistSharesPending = true;
+    return;
+  }
+  persistSharesInFlight = true;
+  try {
+    pruneOldKeyShares();
+    const list = Array.from(keySharesById.values());
+    const tmpFile = `${KEY_SHARES_FILE}.tmp`;
+    await fs.promises.writeFile(tmpFile, JSON.stringify(list), 'utf8');
+    await fs.promises.rename(tmpFile, KEY_SHARES_FILE);
+  } catch {
+    // Ignore transient temp file write errors
+  } finally {
+    persistSharesInFlight = false;
+    if (persistSharesPending) {
+      persistSharesPending = false;
+      void flushKeySharesToDisk();
+    }
+  }
+}
+
+function schedulePersistKeyShares(immediate = false) {
+  if (immediate) {
+    if (persistSharesTimer) {
+      clearTimeout(persistSharesTimer);
+      persistSharesTimer = null;
+    }
+    void flushKeySharesToDisk();
+    return;
+  }
+  if (persistSharesTimer) return;
+  persistSharesTimer = setTimeout(() => {
+    persistSharesTimer = null;
+    void flushKeySharesToDisk();
+  }, 600);
+}
+
+function hashOwnerToken(rawToken: string): string {
+  return crypto.createHash('sha256').update(rawToken).digest('hex');
+}
+
+function extractOwnerTokenHash(req: Request): string {
+  const raw = String(req.headers['x-vellum-owner-token'] || '').trim();
+  if (raw.length < 12) return '';
+  return hashOwnerToken(raw);
+}
+
+function extractRequestShareId(req: Request): string {
+  const fromHeader = String(req.headers['x-vellum-share-id'] || '').trim();
+  if (fromHeader) return fromHeader;
+  const fromQuery = String(req.query?.shareId || '').trim();
+  if (fromQuery) return fromQuery;
+  const fromBody = String(req.body?.shareId || '').trim();
+  if (fromBody) return fromBody;
+  return '';
+}
+
+function computeEffectiveShareStatus(rec: StoredKeyShareRecord): SharedLinkEffectiveStatus {
+  if (rec.status === 'revoked') return 'revoked';
+  if (typeof rec.expiresAt === 'number' && Date.now() >= rec.expiresAt) return 'expired';
+  if (typeof rec.maxMessages === 'number' && rec.usedMessages >= rec.maxMessages) {
+    return 'exhausted';
+  }
+  return 'active';
+}
+
+function toPublicShareSummary(rec: StoredKeyShareRecord): PublicShareSummary {
+  const hostHint =
+    getHostname(rec.baseUrl) ||
+    rec.baseUrl.replace(/^https?:\/\//i, '').split('/')[0] ||
+    'gateway';
+  return {
+    shareId: rec.shareId,
+    label: rec.label,
+    status: rec.status,
+    effectiveStatus: computeEffectiveShareStatus(rec),
+    hostHint,
+    customModels: Array.isArray(rec.customModels) ? [...rec.customModels] : [],
+    createdAt: rec.createdAt,
+    expiresAt: rec.expiresAt,
+    maxMessages: rec.maxMessages,
+    usedMessages: rec.usedMessages,
+    lastUsedAt: rec.lastUsedAt,
+  };
+}
+
+type ResolvedCredentialsResult =
+  | {
+      ok: true;
+      isShared: boolean;
+      apiKey: string;
+      baseUrl: string;
+      wafCookie: string;
+      customModels: string[];
+      shareSummary?: PublicShareSummary;
+    }
+  | {
+      ok: false;
+      status: number;
+      error: string;
+      shareSummary?: PublicShareSummary;
+    };
+
+function resolveRequestCredentials(
+  req: Request,
+  options: { consumeMessageQuota: boolean; blockWhenExhausted: boolean }
+): ResolvedCredentialsResult {
+  const shareId = extractRequestShareId(req);
+  if (!shareId) {
+    return {
+      ok: true,
+      isShared: false,
+      apiKey: extractRequestApiKey(req),
+      baseUrl: extractRequestBaseUrl(req),
+      wafCookie: extractRequestWafCookie(req),
+      customModels: [],
+    };
+  }
+
+  ensureKeySharesLoaded();
+  const rec = keySharesById.get(shareId);
+  if (!rec) {
+    return {
+      ok: false,
+      status: 404,
+      error: 'This shared link was not found or was removed by its owner.',
+    };
+  }
+
+  const effectiveStatus = computeEffectiveShareStatus(rec);
+  if (effectiveStatus === 'revoked') {
+    return {
+      ok: false,
+      status: 403,
+      error: 'This shared link was turned off by its owner.',
+      shareSummary: toPublicShareSummary(rec),
+    };
+  }
+  if (effectiveStatus === 'expired') {
+    return {
+      ok: false,
+      status: 403,
+      error: 'This shared link has passed its time limit.',
+      shareSummary: toPublicShareSummary(rec),
+    };
+  }
+  if (effectiveStatus === 'exhausted' && (options.consumeMessageQuota || options.blockWhenExhausted)) {
+    return {
+      ok: false,
+      status: 429,
+      error: 'This shared link has used all of its allowed messages.',
+      shareSummary: toPublicShareSummary(rec),
+    };
+  }
+
+  if (options.consumeMessageQuota) {
+    rec.usedMessages += 1;
+    rec.lastUsedAt = Date.now();
+    schedulePersistKeyShares(true);
+  } else {
+    rec.lastUsedAt = Date.now();
+    schedulePersistKeyShares(false);
+  }
+
+  return {
+    ok: true,
+    isShared: true,
+    apiKey: rec.apiKey,
+    baseUrl: rec.baseUrl,
+    wafCookie: rec.wafCookie || '',
+    customModels: rec.customModels || [],
+    shareSummary: toPublicShareSummary(rec),
+  };
+}
+
+function mergeCustomModelsIntoList(
+  synced: SyncedModelItem[],
+  customModelIds: string[]
+): SyncedModelItem[] {
+  if (!customModelIds || customModelIds.length === 0) return synced;
+  const seen = new Set(synced.map((m) => m.id));
+  const merged = [...synced];
+  for (const rawId of customModelIds) {
+    const id = rawId.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    merged.push({
+      id,
+      label: id,
+      ownedBy: inferModelOwner(id, ''),
+    });
+  }
+  return merged;
+}
+
+const DEFAULT_AGENTROUTER_SHARED_MODELS: SyncedModelItem[] = [
+  { id: 'gpt-6.1-sol', label: 'gpt-6.1-sol', ownedBy: 'openai' },
+  { id: 'gpt-6-astra', label: 'gpt-6-astra', ownedBy: 'openai' },
+  { id: 'gpt-5.4-sol', label: 'gpt-5.4-sol', ownedBy: 'openai' },
+  { id: 'gpt-6-sol', label: 'gpt-6-sol', ownedBy: 'openai' },
+  { id: 'gpt-5.6-sol', label: 'gpt-5.6-sol', ownedBy: 'openai' },
+  { id: 'gpt-5-codex', label: 'gpt-5-codex', ownedBy: 'openai' },
+  { id: 'gpt-5', label: 'gpt-5', ownedBy: 'openai' },
+  { id: 'gpt-4.1', label: 'gpt-4.1', ownedBy: 'openai' },
+  { id: 'gpt-4o', label: 'gpt-4o', ownedBy: 'openai' },
+  { id: 'o4-mini', label: 'o4-mini', ownedBy: 'openai' },
+];
 
 function getHostname(urlStr: string): string {
   try {
@@ -1654,11 +1956,207 @@ export const app = express();
 
 app.use(express.json({ limit: '4mb' }));
 
-  // 1. Live OpenAI Model Sync using manually provided Base API URL, API Key & optional WAF Cookie
+  // 0. Disguised API Key Share Links Vault (Owner CRUD + Guest Pass Inspection)
+  app.post('/api/shares', async (req: Request, res: Response) => {
+    ensureKeySharesLoaded();
+    const ownerTokenHash = extractOwnerTokenHash(req);
+    if (!ownerTokenHash) {
+      res.status(401).json({ error: 'Missing owner token in browser session.' });
+      return;
+    }
+
+    const {
+      label: rawLabel,
+      baseUrl: rawBaseUrl,
+      apiKey: rawApiKey,
+      wafCookie: rawWafCookie,
+      customModels: rawCustomModels,
+      expiresInHours,
+      maxMessages,
+    } = req.body || {};
+
+    const cleanKey = sanitizeApiKey(String(rawApiKey || ''));
+    const cleanBase = String(rawBaseUrl || '').trim().replace(/\/+$/, '');
+    const cleanCookie = sanitizeCookieHeader(String(rawWafCookie || ''));
+    const { v1Urls } = normalizeManualBaseUrl(cleanBase);
+
+    if (!cleanBase || v1Urls.length === 0) {
+      res.status(400).json({ error: 'Choose a valid Base API connection to share.' });
+      return;
+    }
+    if (!cleanKey) {
+      res.status(400).json({ error: 'Selected connection has no API key saved.' });
+      return;
+    }
+
+    const now = Date.now();
+    let expiresAt: number | null = null;
+    if (
+      typeof expiresInHours === 'number' &&
+      Number.isFinite(expiresInHours) &&
+      expiresInHours > 0
+    ) {
+      expiresAt = now + Math.round(expiresInHours * 3600_000);
+    }
+
+    let parsedMaxMessages: number | null = null;
+    if (
+      typeof maxMessages === 'number' &&
+      Number.isFinite(maxMessages) &&
+      maxMessages > 0
+    ) {
+      parsedMaxMessages = Math.max(1, Math.floor(maxMessages));
+    }
+
+    const customModels = Array.isArray(rawCustomModels)
+      ? Array.from(
+          new Set(
+            rawCustomModels
+              .map((item: unknown) => String(item || '').trim())
+              .filter(Boolean)
+          )
+        )
+      : [];
+
+    const shareId = `vlm_${crypto.randomBytes(12).toString('base64url')}`;
+    const record: StoredKeyShareRecord = {
+      shareId,
+      ownerTokenHash,
+      label: String(rawLabel || '').trim() || 'Shared Access Link',
+      baseUrl: cleanBase,
+      apiKey: cleanKey,
+      ...(cleanCookie ? { wafCookie: cleanCookie } : {}),
+      customModels,
+      status: 'active',
+      createdAt: now,
+      expiresAt,
+      maxMessages: parsedMaxMessages,
+      usedMessages: 0,
+      lastUsedAt: null,
+    };
+
+    keySharesById.set(shareId, record);
+    await flushKeySharesToDisk();
+
+    res.status(201).json({ share: toPublicShareSummary(record) });
+  });
+
+  app.get('/api/shares', (req: Request, res: Response) => {
+    ensureKeySharesLoaded();
+    const ownerTokenHash = extractOwnerTokenHash(req);
+    if (!ownerTokenHash) {
+      res.status(401).json({ error: 'Missing owner token in browser session.', shares: [] });
+      return;
+    }
+
+    const shares = Array.from(keySharesById.values())
+      .filter((item) => item.ownerTokenHash === ownerTokenHash)
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .map(toPublicShareSummary);
+
+    res.json({ shares });
+  });
+
+  app.get('/api/shares/:shareId', (req: Request, res: Response) => {
+    ensureKeySharesLoaded();
+    const shareId = String(req.params.shareId || '').trim();
+    const record = keySharesById.get(shareId);
+    if (!record) {
+      res.status(404).json({
+        error: 'This shared link was not found or was removed by its owner.',
+      });
+      return;
+    }
+
+    res.json({ share: toPublicShareSummary(record) });
+  });
+
+  app.patch('/api/shares/:shareId', async (req: Request, res: Response) => {
+    ensureKeySharesLoaded();
+    const ownerTokenHash = extractOwnerTokenHash(req);
+    if (!ownerTokenHash) {
+      res.status(401).json({ error: 'Missing owner token in browser session.' });
+      return;
+    }
+
+    const shareId = String(req.params.shareId || '').trim();
+    const record = keySharesById.get(shareId);
+    if (!record) {
+      res.status(404).json({ error: 'Shared link not found.' });
+      return;
+    }
+    if (record.ownerTokenHash !== ownerTokenHash) {
+      res.status(403).json({ error: 'Only the creator of this link can modify it.' });
+      return;
+    }
+
+    const { status, label, maxMessages, expiresInHours } = req.body || {};
+
+    if (status === 'active' || status === 'revoked') {
+      record.status = status;
+    }
+    if (typeof label === 'string' && label.trim()) {
+      record.label = label.trim();
+    }
+    if (maxMessages === null) {
+      record.maxMessages = null;
+    } else if (typeof maxMessages === 'number' && Number.isFinite(maxMessages) && maxMessages > 0) {
+      record.maxMessages = Math.max(1, Math.floor(maxMessages));
+    }
+    if (expiresInHours === null) {
+      record.expiresAt = null;
+    } else if (
+      typeof expiresInHours === 'number' &&
+      Number.isFinite(expiresInHours) &&
+      expiresInHours > 0
+    ) {
+      record.expiresAt = Date.now() + Math.round(expiresInHours * 3600_000);
+    }
+
+    await flushKeySharesToDisk();
+    res.json({ share: toPublicShareSummary(record) });
+  });
+
+  app.delete('/api/shares/:shareId', async (req: Request, res: Response) => {
+    ensureKeySharesLoaded();
+    const ownerTokenHash = extractOwnerTokenHash(req);
+    if (!ownerTokenHash) {
+      res.status(401).json({ error: 'Missing owner token in browser session.' });
+      return;
+    }
+
+    const shareId = String(req.params.shareId || '').trim();
+    const record = keySharesById.get(shareId);
+    if (!record) {
+      res.status(404).json({ error: 'Shared link not found.' });
+      return;
+    }
+    if (record.ownerTokenHash !== ownerTokenHash) {
+      res.status(403).json({ error: 'Only the creator of this link can delete it.' });
+      return;
+    }
+
+    keySharesById.delete(shareId);
+    await flushKeySharesToDisk();
+    res.json({ ok: true });
+  });
+
+  // 1. Live OpenAI Model Sync using manually provided Base API URL, API Key, or Disguised Share Pass
   app.get('/api/models', async (req: Request, res: Response) => {
-    const apiKey = extractRequestApiKey(req);
-    const baseUrl = extractRequestBaseUrl(req);
-    const wafCookie = extractRequestWafCookie(req);
+    const creds = resolveRequestCredentials(req, {
+      consumeMessageQuota: false,
+      blockWhenExhausted: false,
+    });
+    if (!creds.ok) {
+      res.status(creds.status).json({
+        error: creds.error,
+        models: [],
+        ...(creds.shareSummary ? { share: creds.shareSummary } : {}),
+      });
+      return;
+    }
+
+    const { apiKey, baseUrl, wafCookie, isShared, customModels, shareSummary } = creds;
 
     if (!baseUrl) {
       res.status(400).json({
@@ -1682,6 +2180,7 @@ app.use(express.json({ limit: '4mb' }));
     let connectedSourceUrl: string | null = null;
     let emptyGatewayNotice: string | undefined;
     let definitiveAuthFailure = false;
+    let hitHtmlFirewall = false;
 
     for (const candidateBase of v1Urls) {
       let tryNextUrl = false;
@@ -1713,6 +2212,7 @@ app.use(express.json({ limit: '4mb' }));
             lastStatus = upstream.status;
             lastError = parseErrorMessage(rawBody, upstream.status, contentType, candidateBase);
             if (isHtmlFirewallOrPage(contentType, rawBody)) {
+              hitHtmlFirewall = true;
               tryNextUrl = true;
               break;
             }
@@ -1730,6 +2230,7 @@ app.use(express.json({ limit: '4mb' }));
           }
 
           if (isHtmlFirewallOrPage(contentType, rawBody)) {
+            hitHtmlFirewall = true;
             lastStatus = 502;
             lastError = parseErrorMessage(rawBody, upstream.status, contentType, candidateBase);
             tryNextUrl = true;
@@ -1772,11 +2273,13 @@ app.use(express.json({ limit: '4mb' }));
             emptyGatewayNotice = gatewayMessage;
           }
 
-          if (syncedModels.length > 0) {
+          const combinedModels = mergeCustomModelsIntoList(syncedModels, customModels);
+          if (combinedModels.length > 0) {
             res.json({
-              models: syncedModels,
-              sourceUrl: candidateBase,
+              models: combinedModels,
+              sourceUrl: isShared ? shareSummary?.hostHint || null : candidateBase,
               ...(gatewayMessage ? { gatewayMessage } : {}),
+              ...(shareSummary ? { share: shareSummary } : {}),
             });
             return;
           }
@@ -1801,26 +2304,89 @@ app.use(express.json({ limit: '4mb' }));
       }
     }
 
+    // In shared-link mode on agentrouter.org when datacenter slider blocked /v1/models,
+    // check co.agentrouter.org/v1/models first, or fall back to standard OpenAI models + owner's customModels
+    if (isShared && isAgentRouterMainHost(baseUrl) && !connectedSourceUrl && !definitiveAuthFailure) {
+      try {
+        const coRes = await fetch('https://co.agentrouter.org/v1/models', {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            Accept: 'application/json',
+          },
+        });
+        if (coRes.ok) {
+          const coText = await coRes.text().catch(() => '');
+          if (coText && !isHtmlFirewallOrPage(coRes.headers.get('content-type') || '', coText)) {
+            const coPayload = JSON.parse(coText);
+            if (!extractGatewayErrorFromJson(coPayload)) {
+              const { models: coModels, gatewayMessage: coMsg } =
+                extractSyncedModelsFromPayload(coPayload);
+              const combinedCo = mergeCustomModelsIntoList(coModels, customModels);
+              if (combinedCo.length > 0) {
+                res.json({
+                  models: combinedCo,
+                  sourceUrl: 'co.agentrouter.org',
+                  ...(coMsg ? { gatewayMessage: coMsg } : {}),
+                  ...(shareSummary ? { share: shareSummary } : {}),
+                });
+                return;
+              }
+            }
+          }
+        }
+      } catch {
+        // Ignore sibling check error
+      }
+
+      if (hitHtmlFirewall) {
+        const fallbackSharedModels = mergeCustomModelsIntoList(
+          DEFAULT_AGENTROUTER_SHARED_MODELS,
+          customModels
+        );
+        res.json({
+          models: fallbackSharedModels,
+          sourceUrl: shareSummary?.hostHint || 'agentrouter.org',
+          ...(shareSummary ? { share: shareSummary } : {}),
+        });
+        return;
+      }
+    }
+
     if (connectedSourceUrl) {
+      const onlyCustom = mergeCustomModelsIntoList([], customModels);
       res.json({
-        models: [],
-        sourceUrl: connectedSourceUrl,
+        models: onlyCustom,
+        sourceUrl: isShared ? shareSummary?.hostHint || null : connectedSourceUrl,
         ...(emptyGatewayNotice ? { gatewayMessage: emptyGatewayNotice } : {}),
+        ...(shareSummary ? { share: shareSummary } : {}),
       });
       return;
     }
 
     res.status(lastStatus === 401 || lastStatus === 403 ? 401 : 502).json({
       error: lastError,
-      models: [],
+      models: mergeCustomModelsIntoList([], customModels),
+      ...(shareSummary ? { share: shareSummary } : {}),
     });
   });
 
   // 1b. Secondary Catalog Fallback Endpoint (/api/pricing and /api/available_models)
   app.get('/api/models/catalog', async (req: Request, res: Response) => {
-    const apiKey = extractRequestApiKey(req);
-    const baseUrl = extractRequestBaseUrl(req);
-    const wafCookie = extractRequestWafCookie(req);
+    const creds = resolveRequestCredentials(req, {
+      consumeMessageQuota: false,
+      blockWhenExhausted: false,
+    });
+    if (!creds.ok) {
+      res.status(creds.status).json({
+        error: creds.error,
+        models: [],
+        ...(creds.shareSummary ? { share: creds.shareSummary } : {}),
+      });
+      return;
+    }
+
+    const { apiKey, baseUrl, wafCookie, isShared, customModels, shareSummary } = creds;
 
     if (!baseUrl) {
       res.status(400).json({ error: 'Missing Base API URL.', models: [] });
@@ -1829,12 +2395,22 @@ app.use(express.json({ limit: '4mb' }));
 
     const { v1Urls, catalogUrls } = normalizeManualBaseUrl(baseUrl);
     if (catalogUrls.length === 0) {
-      res.json({ models: [], sourceUrl: v1Urls[0] || null });
+      res.json({
+        models: mergeCustomModelsIntoList([], customModels),
+        sourceUrl: isShared ? shareSummary?.hostHint || null : v1Urls[0] || null,
+        ...(shareSummary ? { share: shareSummary } : {}),
+      });
       return;
     }
 
     if (isAgentRouterMainHost(baseUrl) && !wafCookie) {
-      res.json({ models: [], sourceUrl: v1Urls[0] || 'https://agentrouter.org/v1' });
+      res.json({
+        models: mergeCustomModelsIntoList([], customModels),
+        sourceUrl: isShared
+          ? shareSummary?.hostHint || 'agentrouter.org'
+          : v1Urls[0] || 'https://agentrouter.org/v1',
+        ...(shareSummary ? { share: shareSummary } : {}),
+      });
       return;
     }
 
@@ -1919,11 +2495,13 @@ app.use(express.json({ limit: '4mb' }));
             emptyCatalogNotice = gatewayMessage;
           }
 
-          if (catalogModels.length > 0) {
+          const combinedCatalog = mergeCustomModelsIntoList(catalogModels, customModels);
+          if (combinedCatalog.length > 0) {
             res.json({
-              models: catalogModels,
-              sourceUrl: v1Urls[0] || catalogUrl,
+              models: combinedCatalog,
+              sourceUrl: isShared ? shareSummary?.hostHint || null : v1Urls[0] || catalogUrl,
               ...(gatewayMessage ? { gatewayMessage } : {}),
+              ...(shareSummary ? { share: shareSummary } : {}),
             });
             return;
           }
@@ -1934,18 +2512,35 @@ app.use(express.json({ limit: '4mb' }));
     }
 
     res.json({
-      models: [],
-      sourceUrl: v1Urls[0] || null,
+      models: mergeCustomModelsIntoList([], customModels),
+      sourceUrl: isShared ? shareSummary?.hostHint || null : v1Urls[0] || null,
       ...(emptyCatalogNotice ? { gatewayMessage: emptyCatalogNotice } : {}),
+      ...(shareSummary ? { share: shareSummary } : {}),
     });
   });
 
   // 2. Live OpenAI Model Test Endpoint (supports /v1/chat/completions and /v1/responses)
   app.post('/api/models/test', async (req: Request, res: Response) => {
-    const apiKey = extractRequestApiKey(req);
-    const baseUrl = extractRequestBaseUrl(req);
-    const wafCookie = extractRequestWafCookie(req);
     const model = String(req.body?.model || '').trim();
+    if (!model) {
+      res.status(400).json({ ok: false, error: 'Model ID is required.' });
+      return;
+    }
+
+    const creds = resolveRequestCredentials(req, {
+      consumeMessageQuota: false,
+      blockWhenExhausted: true,
+    });
+    if (!creds.ok) {
+      res.status(creds.status).json({
+        ok: false,
+        error: creds.error,
+        ...(creds.shareSummary ? { share: creds.shareSummary } : {}),
+      });
+      return;
+    }
+
+    const { apiKey, baseUrl, wafCookie, shareSummary } = creds;
 
     if (!baseUrl) {
       res.status(400).json({ ok: false, error: 'Missing Base API URL.' });
@@ -1953,10 +2548,6 @@ app.use(express.json({ limit: '4mb' }));
     }
     if (!apiKey) {
       res.status(401).json({ ok: false, error: 'Missing API key.' });
-      return;
-    }
-    if (!model) {
-      res.status(400).json({ ok: false, error: 'Model ID is required.' });
       return;
     }
 
@@ -1997,6 +2588,7 @@ app.use(express.json({ limit: '4mb' }));
         model,
         durationMs,
         reply: sample,
+        ...(shareSummary ? { share: shareSummary } : {}),
       });
     } catch (err: unknown) {
       clearTimeout(timeout);
@@ -2013,30 +2605,13 @@ app.use(express.json({ limit: '4mb' }));
         model,
         durationMs,
         error: errorMessage,
+        ...(shareSummary ? { share: shareSummary } : {}),
       });
     }
   });
 
   // 3. Real-Time Streaming Chat Endpoint (OpenAI Chat Completions + OpenAI Responses API)
   app.post('/api/agent/stream', async (req: Request, res: Response) => {
-    const apiKey = extractRequestApiKey(req);
-    const baseUrl = extractRequestBaseUrl(req);
-    const wafCookie = extractRequestWafCookie(req);
-
-    if (!baseUrl) {
-      res.status(400).json({
-        error: 'Add and save your Base API URL first.',
-      });
-      return;
-    }
-
-    if (!apiKey) {
-      res.status(401).json({
-        error: 'Add and save your API key first.',
-      });
-      return;
-    }
-
     const { model, messages, systemPrompt, temperature, maxTokens, reasoningEffort } =
       req.body || {};
     const selectedModel = String(model || '').trim();
@@ -2050,6 +2625,34 @@ app.use(express.json({ limit: '4mb' }));
 
     if (!Array.isArray(messages) || messages.length === 0) {
       res.status(400).json({ error: 'Please write a message first.' });
+      return;
+    }
+
+    const creds = resolveRequestCredentials(req, {
+      consumeMessageQuota: true,
+      blockWhenExhausted: true,
+    });
+    if (!creds.ok) {
+      res.status(creds.status).json({
+        error: creds.error,
+        ...(creds.shareSummary ? { share: creds.shareSummary } : {}),
+      });
+      return;
+    }
+
+    const { apiKey, baseUrl, wafCookie } = creds;
+
+    if (!baseUrl) {
+      res.status(400).json({
+        error: 'Add and save your Base API URL first.',
+      });
+      return;
+    }
+
+    if (!apiKey) {
+      res.status(401).json({
+        error: 'Add and save your API key first.',
+      });
       return;
     }
 
@@ -2111,19 +2714,6 @@ app.use(express.json({ limit: '4mb' }));
   app.post('/api/chat/runs', async (req: Request, res: Response) => {
     ensureChatRunsLoaded();
 
-    const apiKey = extractRequestApiKey(req);
-    const baseUrl = extractRequestBaseUrl(req);
-    const wafCookie = extractRequestWafCookie(req);
-
-    if (!baseUrl) {
-      res.status(400).json({ error: 'Add and save your Base API URL first.' });
-      return;
-    }
-    if (!apiKey) {
-      res.status(401).json({ error: 'Add and save your API key first.' });
-      return;
-    }
-
     const {
       runId: rawRunId,
       workspaceId: rawWorkspaceId,
@@ -2157,6 +2747,29 @@ app.use(express.json({ limit: '4mb' }));
     const existing = chatRunsById.get(runId);
     if (existing) {
       res.status(200).json({ run: existing.record });
+      return;
+    }
+
+    const creds = resolveRequestCredentials(req, {
+      consumeMessageQuota: true,
+      blockWhenExhausted: true,
+    });
+    if (!creds.ok) {
+      res.status(creds.status).json({
+        error: creds.error,
+        ...(creds.shareSummary ? { share: creds.shareSummary } : {}),
+      });
+      return;
+    }
+
+    const { apiKey, baseUrl, wafCookie, shareSummary } = creds;
+
+    if (!baseUrl) {
+      res.status(400).json({ error: 'Add and save your Base API URL first.' });
+      return;
+    }
+    if (!apiKey) {
+      res.status(401).json({ error: 'Add and save your API key first.' });
       return;
     }
 
@@ -2297,7 +2910,10 @@ app.use(express.json({ limit: '4mb' }));
     })();
 
     registerRuntimeWaitUntil(runPromise);
-    res.status(202).json({ run: entry.record });
+    res.status(202).json({
+      run: entry.record,
+      ...(shareSummary ? { share: shareSummary } : {}),
+    });
   });
 
   app.get('/api/chat/runs', (req: Request, res: Response) => {
@@ -2446,9 +3062,6 @@ app.use(express.json({ limit: '4mb' }));
   });
 
   app.post('/api/inbox', async (req: Request, res: Response) => {
-    const apiKey = extractRequestApiKey(req);
-    const baseUrl = extractRequestBaseUrl(req);
-    const wafCookie = extractRequestWafCookie(req);
     const isServerless = Boolean(process.env.VERCEL);
     const {
       workspaceId: bodyWorkspace,
@@ -2473,6 +3086,20 @@ app.use(express.json({ limit: '4mb' }));
       return;
     }
 
+    const creds = resolveRequestCredentials(req, {
+      consumeMessageQuota: Boolean(autoRun),
+      blockWhenExhausted: Boolean(autoRun),
+    });
+    if (!creds.ok) {
+      res.status(creds.status).json({
+        error: creds.error,
+        ...(creds.shareSummary ? { share: creds.shareSummary } : {}),
+      });
+      return;
+    }
+
+    const { apiKey, baseUrl, wafCookie, shareSummary } = creds;
+
     const task: InboundAgentTask = {
       id: `req_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       workspaceId,
@@ -2493,12 +3120,12 @@ app.use(express.json({ limit: '4mb' }));
     broadcastInboxEvent(workspaceId, 'task_created', task);
 
     if (!autoRun) {
-      res.status(202).json({ task });
+      res.status(202).json({ task, ...(shareSummary ? { share: shareSummary } : {}) });
       return;
     }
 
     if (!isServerless) {
-      res.status(202).json({ task });
+      res.status(202).json({ task, ...(shareSummary ? { share: shareSummary } : {}) });
     }
 
     if (!baseUrl || !apiKey) {

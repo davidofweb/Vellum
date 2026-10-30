@@ -1,4 +1,4 @@
-import { BackgroundChatRunState, ModelOption } from '../types';
+import { BackgroundChatRunState, ModelOption, SharedKeyLinkSummary } from '../types';
 
 export interface ChatPayloadMessage {
   role: 'system' | 'user' | 'assistant';
@@ -10,6 +10,7 @@ export interface GatewaySyncResponse {
   sourceUrl: string | null;
   gatewayMessage?: string;
   verifiedResults?: Record<string, { durationMs: number; reply: string }>;
+  share?: SharedKeyLinkSummary;
 }
 
 type BrowserWireProtocol = 'openai-chat' | 'openai-responses' | 'anthropic';
@@ -564,8 +565,32 @@ const unsupportedReasoningParamCache = new Set<string>();
 export async function fetchCatalogFallbackModels(
   baseUrl: string,
   rawApiKey: string,
-  rawWafCookie?: string
+  rawWafCookie?: string,
+  shareId?: string
 ): Promise<GatewaySyncResponse> {
+  const cleanShareId = (shareId || '').trim();
+  if (cleanShareId) {
+    try {
+      const res = await fetch('/api/models/catalog', {
+        headers: {
+          'x-vellum-share-id': cleanShareId,
+        },
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        return {
+          models: Array.isArray(data.models) ? data.models : [],
+          sourceUrl: typeof data.sourceUrl === 'string' ? data.sourceUrl : null,
+          gatewayMessage: typeof data.gatewayMessage === 'string' ? data.gatewayMessage : undefined,
+          share: data.share as SharedKeyLinkSummary | undefined,
+        };
+      }
+    } catch {
+      // Ignore fallback error
+    }
+    return { models: [], sourceUrl: null };
+  }
+
   const apiKey = sanitizeApiKey(rawApiKey);
   const cleanBase = sanitizeBaseUrlInput(baseUrl);
   const wafCookie = sanitizeWafCookie(rawWafCookie);
@@ -669,15 +694,44 @@ export async function fetchCatalogFallbackModels(
 }
 
 /**
- * Syncs models from the primary `/v1/models` endpoint on the user's Base API URL.
- * When this returns 0 models, `syncModelsForKey` automatically falls back to
- * `fetchCatalogFallbackModels` (`/api/pricing` and `/api/available_models`).
+ * Syncs models from the primary `/v1/models` endpoint on the user's Base API URL
+ * or via a disguised shared pass (`x-vellum-share-id`).
  */
 export async function syncModelsFromGateway(
   baseUrl: string,
   rawApiKey: string,
-  rawWafCookie?: string
+  rawWafCookie?: string,
+  shareId?: string
 ): Promise<GatewaySyncResponse> {
+  const cleanShareId = (shareId || '').trim();
+  if (cleanShareId) {
+    const res = await fetch('/api/models', {
+      headers: {
+        'x-vellum-share-id': cleanShareId,
+      },
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error(String(data.error || `Failed to sync models (${res.status})`)) as Error & {
+        share?: SharedKeyLinkSummary;
+      };
+      if (data.share) {
+        err.share = data.share as SharedKeyLinkSummary;
+      }
+      throw err;
+    }
+    return {
+      models: Array.isArray(data.models) ? data.models : [],
+      sourceUrl: typeof data.sourceUrl === 'string' ? data.sourceUrl : null,
+      gatewayMessage: typeof data.gatewayMessage === 'string' ? data.gatewayMessage : undefined,
+      verifiedResults:
+        data.verifiedResults && typeof data.verifiedResults === 'object'
+          ? data.verifiedResults
+          : undefined,
+      share: data.share as SharedKeyLinkSummary | undefined,
+    };
+  }
+
   const apiKey = sanitizeApiKey(rawApiKey);
   const cleanBase = sanitizeBaseUrlInput(baseUrl);
   const wafCookie = sanitizeWafCookie(rawWafCookie);
@@ -1619,8 +1673,11 @@ export async function testModelOnGateway(params: {
   baseUrl: string;
   rawApiKey: string;
   rawWafCookie?: string;
+  shareId?: string;
+  onShareUpdated?: (share: SharedKeyLinkSummary) => void;
   model: string;
 }): Promise<{ ok: boolean; durationMs: number; reply?: string; error?: string }> {
+  const cleanShareId = (params.shareId || '').trim();
   const apiKey = sanitizeApiKey(params.rawApiKey);
   const cleanBase = sanitizeBaseUrlInput(params.baseUrl);
   const wafCookie = sanitizeWafCookie(params.rawWafCookie);
@@ -1633,7 +1690,7 @@ export async function testModelOnGateway(params: {
   let browserDirectError: string | null = null;
 
   try {
-    if (!wafCookie) {
+    if (!cleanShareId && !wafCookie) {
       const direct = await openDirectBrowserStream({
         baseUrl: cleanBase,
         apiKey,
@@ -1687,17 +1744,25 @@ export async function testModelOnGateway(params: {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-agentrouter-key': apiKey,
-        'x-agentrouter-base-url': cleanBase,
-        ...(wafCookie ? { 'x-agentrouter-cookie': wafCookie } : {}),
+        ...(cleanShareId
+          ? { 'x-vellum-share-id': cleanShareId }
+          : {
+              'x-agentrouter-key': apiKey,
+              'x-agentrouter-base-url': cleanBase,
+              ...(wafCookie ? { 'x-agentrouter-cookie': wafCookie } : {}),
+            }),
       },
       body: JSON.stringify({ model: params.model }),
       signal: controller.signal,
     });
     clearTimeout(timeout);
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
 
-    if (data.ok) {
+    if (data?.share && params.onShareUpdated) {
+      params.onShareUpdated(data.share as SharedKeyLinkSummary);
+    }
+
+    if (data.ok && !cleanShareId) {
       browserRouteCache.set(`${cleanBase}::${params.model}`, { transport: 'proxy' });
     }
 
@@ -1735,6 +1800,7 @@ export async function streamChatFromGateway(params: {
   baseUrl: string;
   rawApiKey: string;
   rawWafCookie?: string;
+  shareId?: string;
   model: string;
   messages: ChatPayloadMessage[];
   systemPrompt?: string;
@@ -1744,15 +1810,16 @@ export async function streamChatFromGateway(params: {
   onContent: (chunk: string) => void;
   onThinking: (chunk: string) => void;
 }): Promise<void> {
+  const cleanShareId = (params.shareId || '').trim();
   const apiKey = sanitizeApiKey(params.rawApiKey);
   const cleanBase = sanitizeBaseUrlInput(params.baseUrl);
   const wafCookie = sanitizeWafCookie(params.rawWafCookie);
-  const routeKey = `${cleanBase}::${params.model}`;
+  const routeKey = `${cleanShareId || cleanBase}::${params.model}`;
   const cachedRoute = browserRouteCache.get(routeKey);
 
   let browserDirectError: string | null = null;
 
-  if (!wafCookie && cachedRoute?.transport !== 'proxy') {
+  if (!cleanShareId && !wafCookie && cachedRoute?.transport !== 'proxy') {
     const direct = await openDirectBrowserStream({
       baseUrl: cleanBase,
       apiKey,
@@ -1791,9 +1858,13 @@ export async function streamChatFromGateway(params: {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-agentrouter-key': apiKey,
-      'x-agentrouter-base-url': cleanBase,
-      ...(wafCookie ? { 'x-agentrouter-cookie': wafCookie } : {}),
+      ...(cleanShareId
+        ? { 'x-vellum-share-id': cleanShareId }
+        : {
+            'x-agentrouter-key': apiKey,
+            'x-agentrouter-base-url': cleanBase,
+            ...(wafCookie ? { 'x-agentrouter-cookie': wafCookie } : {}),
+          }),
     },
     body: JSON.stringify({
       model: params.model,
@@ -1821,7 +1892,9 @@ export async function streamChatFromGateway(params: {
     throw new Error(browserDirectError || 'Empty stream returned from server.');
   }
 
-  browserRouteCache.set(routeKey, { transport: 'proxy' });
+  if (!cleanShareId) {
+    browserRouteCache.set(routeKey, { transport: 'proxy' });
+  }
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
@@ -1874,6 +1947,8 @@ export async function startBackgroundChatRun(params: {
   baseUrl: string;
   rawApiKey: string;
   rawWafCookie?: string;
+  shareId?: string;
+  onShareUpdated?: (share: SharedKeyLinkSummary) => void;
   model: string;
   messages: ChatPayloadMessage[];
   systemPrompt?: string;
@@ -1883,6 +1958,7 @@ export async function startBackgroundChatRun(params: {
   initialThinking?: string;
   baseThinkingSeconds?: number;
 }): Promise<BackgroundChatRunState> {
+  const cleanShareId = (params.shareId || '').trim();
   const apiKey = sanitizeApiKey(params.rawApiKey);
   const cleanBase = sanitizeBaseUrlInput(params.baseUrl);
   const wafCookie = sanitizeWafCookie(params.rawWafCookie);
@@ -1906,9 +1982,13 @@ export async function startBackgroundChatRun(params: {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-agentrouter-key': apiKey,
-      'x-agentrouter-base-url': cleanBase,
-      ...(wafCookie ? { 'x-agentrouter-cookie': wafCookie } : {}),
+      ...(cleanShareId
+        ? { 'x-vellum-share-id': cleanShareId }
+        : {
+            'x-agentrouter-key': apiKey,
+            'x-agentrouter-base-url': cleanBase,
+            ...(wafCookie ? { 'x-agentrouter-cookie': wafCookie } : {}),
+          }),
     },
     body: bodyStr,
     // Keep initiation alive across tab close when payload fits browser keepalive limit
@@ -1916,11 +1996,121 @@ export async function startBackgroundChatRun(params: {
   });
 
   const data = await res.json().catch(() => ({}));
+  if (data?.share && params.onShareUpdated) {
+    params.onShareUpdated(data.share as SharedKeyLinkSummary);
+  }
   if (!res.ok || !data?.run) {
     throw new Error(String(data?.error || `Unable to start background run (${res.status})`));
   }
 
   return data.run as BackgroundChatRunState;
+}
+
+export async function createSharedKeyLink(params: {
+  ownerToken: string;
+  label: string;
+  baseUrl: string;
+  rawApiKey: string;
+  rawWafCookie?: string;
+  customModels?: string[];
+  expiresInHours: number | null;
+  maxMessages: number | null;
+}): Promise<SharedKeyLinkSummary> {
+  const res = await fetch('/api/shares', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-vellum-owner-token': params.ownerToken,
+    },
+    body: JSON.stringify({
+      label: params.label,
+      baseUrl: sanitizeBaseUrlInput(params.baseUrl),
+      apiKey: sanitizeApiKey(params.rawApiKey),
+      wafCookie: sanitizeWafCookie(params.rawWafCookie) || undefined,
+      customModels: params.customModels || [],
+      expiresInHours: params.expiresInHours,
+      maxMessages: params.maxMessages,
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.share) {
+    throw new Error(String(data?.error || `Could not create shared link (${res.status})`));
+  }
+  return data.share as SharedKeyLinkSummary;
+}
+
+export async function fetchOwnerSharedLinks(
+  ownerToken: string
+): Promise<SharedKeyLinkSummary[]> {
+  if (!ownerToken.trim()) return [];
+  const res = await fetch('/api/shares', {
+    headers: {
+      Accept: 'application/json',
+      'x-vellum-owner-token': ownerToken,
+    },
+    cache: 'no-store',
+  });
+  if (!res.ok) return [];
+  const data = await res.json().catch(() => ({}));
+  return Array.isArray(data?.shares) ? (data.shares as SharedKeyLinkSummary[]) : [];
+}
+
+export async function fetchPublicSharePass(
+  shareId: string
+): Promise<SharedKeyLinkSummary> {
+  const res = await fetch(`/api/shares/${encodeURIComponent(shareId.trim())}`, {
+    headers: { Accept: 'application/json' },
+    cache: 'no-store',
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.share) {
+    throw new Error(String(data?.error || 'This shared link is no longer available.'));
+  }
+  return data.share as SharedKeyLinkSummary;
+}
+
+export async function updateSharedKeyLink(params: {
+  ownerToken: string;
+  shareId: string;
+  status?: 'active' | 'revoked';
+  label?: string;
+  maxMessages?: number | null;
+  expiresInHours?: number | null;
+}): Promise<SharedKeyLinkSummary> {
+  const res = await fetch(`/api/shares/${encodeURIComponent(params.shareId.trim())}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-vellum-owner-token': params.ownerToken,
+    },
+    body: JSON.stringify({
+      ...(params.status !== undefined ? { status: params.status } : {}),
+      ...(params.label !== undefined ? { label: params.label } : {}),
+      ...(params.maxMessages !== undefined ? { maxMessages: params.maxMessages } : {}),
+      ...(params.expiresInHours !== undefined ? { expiresInHours: params.expiresInHours } : {}),
+    }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.share) {
+    throw new Error(String(data?.error || `Could not update shared link (${res.status})`));
+  }
+  return data.share as SharedKeyLinkSummary;
+}
+
+export async function deleteSharedKeyLink(
+  ownerToken: string,
+  shareId: string
+): Promise<void> {
+  const res = await fetch(`/api/shares/${encodeURIComponent(shareId.trim())}`, {
+    method: 'DELETE',
+    headers: {
+      'x-vellum-owner-token': ownerToken,
+    },
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(String(data?.error || `Could not remove shared link (${res.status})`));
+  }
 }
 
 export async function fetchWorkspaceChatRuns(

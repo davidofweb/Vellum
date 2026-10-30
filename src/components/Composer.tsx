@@ -12,7 +12,7 @@ import {
   X,
   Zap,
 } from 'lucide-react';
-import { AgentRole, Attachment, ModelOption, ModelTestResult } from '../types';
+import { AgentRole, Attachment, ManagerTab, ModelOption, ModelTestResult } from '../types';
 import { isReasoningStyleModel } from '../utils/gateway';
 
 interface ComposerProps {
@@ -22,6 +22,8 @@ interface ComposerProps {
   onStop: () => void;
   isStreaming: boolean;
   hasActiveKey: boolean;
+  isGuestMode?: boolean;
+  guestPassBlockedReason?: string | null;
   attachments: Attachment[];
   onAddAttachments: (items: Attachment[]) => void;
   onRemoveAttachment: (id: string) => void;
@@ -32,7 +34,7 @@ interface ComposerProps {
   onTestModel: (modelId: string) => Promise<void>;
   isSyncingModels: boolean;
   onSyncModels: () => Promise<void>;
-  onOpenModelsManager: (tab: 'models' | 'keys') => void;
+  onOpenModelsManager: (tab: ManagerTab) => void;
   roles: AgentRole[];
   selectedRole: AgentRole;
   onSelectRole: (roleId: string) => void;
@@ -47,6 +49,8 @@ export const Composer: React.FC<ComposerProps> = ({
   onStop,
   isStreaming,
   hasActiveKey,
+  isGuestMode = false,
+  guestPassBlockedReason = null,
   attachments,
   onAddAttachments,
   onRemoveAttachment,
@@ -80,6 +84,7 @@ export const Composer: React.FC<ComposerProps> = ({
 
   const canSend =
     hasActiveKey &&
+    !guestPassBlockedReason &&
     Boolean(selectedModel) &&
     !isStreaming &&
     (Boolean(input.trim()) || attachments.length > 0);
@@ -113,7 +118,9 @@ export const Composer: React.FC<ComposerProps> = ({
 
   const activeModelObj = models.find((m) => m.id === selectedModel);
   const modelButtonText = !hasActiveKey
-    ? 'Set Base API & key'
+    ? isGuestMode
+      ? 'Shared pass'
+      : 'Set Base API & key'
     : isSyncingModels && models.length === 0
       ? 'Syncing models...'
       : activeModelObj
@@ -161,13 +168,15 @@ export const Composer: React.FC<ComposerProps> = ({
           onChange={(e) => onChangeInput(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder={
-            !hasActiveKey
-              ? 'Save your Base API and key above to begin...'
-              : !selectedModel
-                ? 'Sync and pick a model below to start writing...'
-                : `Message ${selectedRole.name}...`
+            guestPassBlockedReason
+              ? 'Shared link ended — tap Use My Own Key above to continue...'
+              : !hasActiveKey
+                ? 'Save your Base API and key above to begin...'
+                : !selectedModel
+                  ? 'Sync and pick a model below to start writing...'
+                  : `Message ${selectedRole.name}...`
           }
-          className="w-full max-h-[200px] px-4 sm:px-5 pt-3.5 pb-2 bg-transparent text-[16px] leading-relaxed text-foreground placeholder:text-muted-foreground focus:outline-none resize-none"
+          className="w-full max-h-[200px] px-4 sm:px-5 pt-3.5 pb-2 bg-transparent text-[16px] font-medium leading-relaxed text-foreground placeholder:font-normal placeholder:text-muted-foreground focus:outline-none resize-none"
         />
 
         {/* Bottom Action Toolbar */}
@@ -197,7 +206,7 @@ export const Composer: React.FC<ComposerProps> = ({
                 setShowRoleSheet((v) => !v);
                 setShowModelSheet(false);
               }}
-              className="min-h-[44px] px-2.5 sm:px-3 rounded-full text-xs font-mono font-medium text-foreground hover:bg-foreground/5 flex items-center gap-1 transition-colors whitespace-nowrap shrink-0"
+              className="min-h-[44px] px-2.5 sm:px-3 rounded-full text-xs font-mono font-semibold text-foreground hover:bg-foreground/5 flex items-center gap-1 transition-colors whitespace-nowrap shrink-0"
             >
               <span className="truncate max-w-[78px] sm:max-w-[130px]">{selectedRole.name}</span>
               <ChevronDown className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
@@ -208,13 +217,13 @@ export const Composer: React.FC<ComposerProps> = ({
               type="button"
               onClick={() => {
                 if (!hasActiveKey) {
-                  onOpenModelsManager('keys');
+                  onOpenModelsManager(isGuestMode ? 'shares' : 'keys');
                   return;
                 }
                 setShowModelSheet((v) => !v);
                 setShowRoleSheet(false);
               }}
-              className="min-h-[44px] px-2.5 sm:px-3 rounded-full text-xs font-mono font-medium text-muted-foreground hover:text-foreground hover:bg-foreground/5 flex items-center gap-1 transition-colors shrink-0"
+              className="min-h-[44px] px-2.5 sm:px-3 rounded-full text-xs font-mono font-semibold text-muted-foreground hover:text-foreground hover:bg-foreground/5 flex items-center gap-1 transition-colors shrink-0"
             >
               <span className="truncate max-w-[100px] sm:max-w-[190px]">{modelButtonText}</span>
               <ChevronDown className="w-3.5 h-3.5 opacity-70 shrink-0" />

@@ -13,6 +13,7 @@ import {
   GitBranch,
   KeyRound,
   Layers,
+  Link2,
   Loader2,
   Menu,
   Moon,
@@ -36,17 +37,23 @@ import {
   ChatMessage,
   Conversation,
   InboundAgentTask,
+  ManagerTab,
   ModelOption,
   ModelTestResult,
   SavedUserKey,
+  SharedKeyLinkSummary,
 } from './types';
 import { BASE_API_PRESETS, BUILT_IN_ROLES, STARTER_PROMPTS } from './constants';
 import { extractArtifactsFromText } from './utils/artifacts';
 import {
   AGENTROUTER_OPENAI_MODELS,
   cancelBackgroundChatRun,
+  createSharedKeyLink,
+  deleteSharedKeyLink,
   fetchBackgroundChatRun,
   fetchCatalogFallbackModels,
+  fetchOwnerSharedLinks,
+  fetchPublicSharePass,
   fetchWorkspaceChatRuns,
   isAgentRouterFamilyHost,
   isAgentRouterMainHost,
@@ -61,12 +68,16 @@ import {
   subscribeToBackgroundChatRun,
   syncModelsFromGateway,
   testModelOnGateway,
+  updateSharedKeyLink,
 } from './utils/gateway';
 import { MarkdownRenderer } from './components/MarkdownRenderer';
 import { CanvasDrawer } from './components/CanvasDrawer';
 import { Sidebar } from './components/Sidebar';
 import { Composer } from './components/Composer';
-import { KeyModelsModal } from './components/KeyModelsModal';
+import {
+  KeyModelsModal,
+  formatShareRemainingTime,
+} from './components/KeyModelsModal';
 import { InstallAppModal } from './components/InstallAppModal';
 import { isSpeechSynthesisSupported, prepareTextForSpeech } from './utils/speech';
 import {
@@ -86,6 +97,54 @@ const STORAGE_FAST_REPLIES_KEY = 'vellum_fast_replies_v1';
 const STORAGE_STICKY_SCROLL_KEY = 'vellum_sticky_scroll_v1';
 const STORAGE_ACTIVE_CHAT_ID = 'vellum_active_chat_id_v1';
 const STORAGE_DRAFT_INPUT_KEY = 'vellum_draft_input_v1';
+const STORAGE_OWNER_TOKEN_KEY = 'vellum_share_owner_token_v1';
+const STORAGE_GUEST_SHARE_ID_KEY = 'vellum_guest_share_id_v1';
+const STORAGE_GUEST_CUSTOM_MODELS_KEY = 'vellum_guest_custom_models_v1';
+
+function getOrCreateOwnerToken(): string {
+  try {
+    const existing = localStorage.getItem(STORAGE_OWNER_TOKEN_KEY);
+    if (existing && existing.trim().length >= 16) {
+      return existing.trim();
+    }
+    const bytes = new Uint8Array(24);
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+      crypto.getRandomValues(bytes);
+    } else {
+      for (let i = 0; i < bytes.length; i += 1) {
+        bytes[i] = Math.floor(Math.random() * 256);
+      }
+    }
+    const token =
+      'own_' +
+      Array.from(bytes)
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    localStorage.setItem(STORAGE_OWNER_TOKEN_KEY, token);
+    return token;
+  } catch {
+    return `own_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 14)}`;
+  }
+}
+
+function readInitialGuestShareId(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    const url = new URL(window.location.href);
+    const fromQuery = (url.searchParams.get('share') || '').trim();
+    if (fromQuery) {
+      localStorage.setItem(STORAGE_GUEST_SHARE_ID_KEY, fromQuery);
+      url.searchParams.delete('share');
+      const nextRelative =
+        url.pathname + (url.searchParams.toString() ? `?${url.searchParams.toString()}` : '') + url.hash;
+      window.history.replaceState({}, '', nextRelative);
+      return fromQuery;
+    }
+    return (localStorage.getItem(STORAGE_GUEST_SHARE_ID_KEY) || '').trim();
+  } catch {
+    return '';
+  }
+}
 
 function recoverSavedConversations(rawList: unknown): Conversation[] | null {
   if (!Array.isArray(rawList) || rawList.length === 0) return null;
@@ -173,6 +232,42 @@ export default function App() {
 
   const activeKeyObj =
     savedKeys.find((k) => k.id === activeKeyId) || savedKeys[0] || null;
+
+  const [ownerToken] = useState<string>(() => getOrCreateOwnerToken());
+  const [sharedLinks, setSharedLinks] = useState<SharedKeyLinkSummary[]>([]);
+  const [isLoadingShares, setIsLoadingShares] = useState<boolean>(false);
+
+  const [guestShareId, setGuestShareId] = useState<string>(() => readInitialGuestShareId());
+  const [guestSharePass, setGuestSharePass] = useState<SharedKeyLinkSummary | null>(null);
+  const [guestPassError, setGuestPassError] = useState<string | null>(null);
+  const [isRefreshingGuestPass, setIsRefreshingGuestPass] = useState<boolean>(false);
+  const [guestCustomModels, setGuestCustomModels] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_GUEST_CUSTOM_MODELS_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  const isGuestMode = Boolean(guestShareId);
+  const hasActiveConnection = isGuestMode || Boolean(activeKeyObj);
+
+  const guestPassBlockedReason = useMemo(() => {
+    if (!isGuestMode) return null;
+    if (guestPassError) return guestPassError;
+    if (!guestSharePass) return null;
+    if (guestSharePass.effectiveStatus === 'revoked') {
+      return 'This shared link was turned off by its owner.';
+    }
+    if (guestSharePass.effectiveStatus === 'expired') {
+      return 'This shared link has passed its time limit.';
+    }
+    if (guestSharePass.effectiveStatus === 'exhausted') {
+      return 'This shared link has used all of its allowed messages.';
+    }
+    return null;
+  }, [isGuestMode, guestPassError, guestSharePass]);
 
   const [models, setModels] = useState<ModelOption[]>([]);
   const [isSyncingModels, setIsSyncingModels] = useState(false);
@@ -287,7 +382,8 @@ export default function App() {
   const isOnline = useOnlineStatus();
 
   const [managerOpen, setManagerOpen] = useState(false);
-  const [managerTab, setManagerTab] = useState<'models' | 'keys'>('models');
+  const [managerTab, setManagerTab] = useState<ManagerTab>('models');
+  const [managerShareKeyId, setManagerShareKeyId] = useState<string | undefined>(undefined);
 
   const [inlineLabel, setInlineLabel] = useState('');
   const [inlineBaseUrl, setInlineBaseUrl] = useState('https://agentrouter.org/v1');
@@ -465,6 +561,282 @@ export default function App() {
     }
   }, [selectedModel]);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_GUEST_CUSTOM_MODELS_KEY, JSON.stringify(guestCustomModels));
+    } catch {
+      // Ignore
+    }
+  }, [guestCustomModels]);
+
+  const refreshOwnerShares = useCallback(async () => {
+    if (!ownerToken) return;
+    setIsLoadingShares(true);
+    try {
+      const list = await fetchOwnerSharedLinks(ownerToken);
+      setSharedLinks(list);
+    } finally {
+      setIsLoadingShares(false);
+    }
+  }, [ownerToken]);
+
+  useEffect(() => {
+    if (savedKeys.length > 0) {
+      void refreshOwnerShares();
+    }
+  }, [savedKeys.length, refreshOwnerShares]);
+
+  const handleCreateShareLink = useCallback(
+    async (params: {
+      keyId: string;
+      label: string;
+      expiresInHours: number | null;
+      maxMessages: number | null;
+    }): Promise<SharedKeyLinkSummary> => {
+      const targetKey =
+        savedKeys.find((k) => k.id === params.keyId) || activeKeyObj;
+      if (!targetKey) {
+        throw new Error('Pick a saved key first.');
+      }
+      const created = await createSharedKeyLink({
+        ownerToken,
+        label: params.label,
+        baseUrl: targetKey.baseUrl,
+        rawApiKey: targetKey.apiKey,
+        rawWafCookie: targetKey.wafCookie,
+        customModels: targetKey.customModels,
+        expiresInHours: params.expiresInHours,
+        maxMessages: params.maxMessages,
+      });
+      setSharedLinks((prev) => [
+        created,
+        ...prev.filter((item) => item.shareId !== created.shareId),
+      ]);
+      return created;
+    },
+    [savedKeys, activeKeyObj, ownerToken]
+  );
+
+  const handleToggleRevokeShareLink = useCallback(
+    async (shareId: string, nextStatus: 'active' | 'revoked') => {
+      const updated = await updateSharedKeyLink({
+        ownerToken,
+        shareId,
+        status: nextStatus,
+      });
+      setSharedLinks((prev) =>
+        prev.map((item) => (item.shareId === shareId ? updated : item))
+      );
+      if (guestShareId === shareId) {
+        setGuestSharePass(updated);
+        if (updated.effectiveStatus === 'active') {
+          setGuestPassError(null);
+        }
+      }
+    },
+    [ownerToken, guestShareId]
+  );
+
+  const handleDeleteShareLink = useCallback(
+    async (shareId: string) => {
+      await deleteSharedKeyLink(ownerToken, shareId);
+      setSharedLinks((prev) => prev.filter((item) => item.shareId !== shareId));
+      if (guestShareId === shareId) {
+        setGuestSharePass(null);
+        setGuestPassError('This shared link was removed by its owner.');
+      }
+    },
+    [ownerToken, guestShareId]
+  );
+
+  const handleRefreshGuestPass = useCallback(async () => {
+    if (!guestShareId) return;
+    setIsRefreshingGuestPass(true);
+    try {
+      const latestPass = await fetchPublicSharePass(guestShareId);
+      setGuestSharePass(latestPass);
+      setGuestPassError(null);
+    } catch (err: unknown) {
+      const msg =
+        err instanceof Error ? err.message : 'This shared link is no longer available.';
+      setGuestPassError(msg);
+    } finally {
+      setIsRefreshingGuestPass(false);
+    }
+  }, [guestShareId]);
+
+  const handleExitGuestMode = useCallback(() => {
+    try {
+      localStorage.removeItem(STORAGE_GUEST_SHARE_ID_KEY);
+    } catch {
+      // Ignore
+    }
+    setGuestShareId('');
+    setGuestSharePass(null);
+    setGuestPassError(null);
+    setModelTests({});
+    setSyncError(null);
+  }, []);
+
+  const buildCustomModelOptions = useCallback(
+    (ids?: string[]): ModelOption[] =>
+      (ids || [])
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((id) => ({
+          id,
+          label: id,
+          ownedBy: id.includes('/') ? id.split('/')[0] : 'openai',
+        })),
+    []
+  );
+
+  const syncModelsForGuest = useCallback(
+    async (shareIdToSync: string, localCustomIds: string[]) => {
+      if (!shareIdToSync.trim()) return;
+      setIsSyncingModels(true);
+      setSyncError(null);
+      setGuestPassError(null);
+
+      try {
+        let passSummary: SharedKeyLinkSummary | undefined;
+        try {
+          passSummary = await fetchPublicSharePass(shareIdToSync);
+          setGuestSharePass(passSummary);
+        } catch (passErr: unknown) {
+          const msg =
+            passErr instanceof Error
+              ? passErr.message
+              : 'This shared link was not found or was removed.';
+          setGuestSharePass(null);
+          setGuestPassError(msg);
+          setModels([]);
+          setSelectedModel('');
+          setSyncedSourceUrl(null);
+          return;
+        }
+
+        if (
+          passSummary.effectiveStatus === 'revoked' ||
+          passSummary.effectiveStatus === 'expired'
+        ) {
+          const customFallback = buildCustomModelOptions([
+            ...passSummary.customModels,
+            ...localCustomIds,
+          ]);
+          setModels(customFallback);
+          setSelectedModel((prev) =>
+            customFallback.some((m) => m.id === prev) ? prev : customFallback[0]?.id || ''
+          );
+          setSyncedSourceUrl(passSummary.hostHint);
+          return;
+        }
+
+        let data = await syncModelsFromGateway('', '', undefined, shareIdToSync);
+        if (data.share) {
+          passSummary = data.share;
+          setGuestSharePass(data.share);
+        }
+
+        if (data.models.length === 0) {
+          const fallbackData = await fetchCatalogFallbackModels(
+            '',
+            '',
+            undefined,
+            shareIdToSync
+          );
+          if (fallbackData.share) {
+            passSummary = fallbackData.share;
+            setGuestSharePass(fallbackData.share);
+          }
+          if (fallbackData.models.length > 0) {
+            data = {
+              ...data,
+              models: fallbackData.models,
+              sourceUrl: fallbackData.sourceUrl || data.sourceUrl,
+              gatewayMessage: fallbackData.gatewayMessage || data.gatewayMessage,
+            };
+          } else if (
+            passSummary?.hostHint === 'agentrouter.org' ||
+            passSummary?.hostHint === 'www.agentrouter.org'
+          ) {
+            data = {
+              ...data,
+              models: AGENTROUTER_OPENAI_MODELS.map((m) => ({ ...m })),
+              sourceUrl: data.sourceUrl || passSummary.hostHint,
+            };
+          }
+        }
+
+        setSyncedSourceUrl(data.sourceUrl || passSummary?.hostHint || null);
+
+        if (data.verifiedResults) {
+          const now = Date.now();
+          setModelTests((prev) => {
+            const next = { ...prev };
+            for (const [mId, info] of Object.entries(data.verifiedResults!)) {
+              next[mId] = {
+                status: 'ok',
+                durationMs: info.durationMs,
+                reply: info.reply,
+                testedAt: now,
+              };
+            }
+            return next;
+          });
+        }
+
+        const seen = new Set<string>();
+        const mergedModels: ModelOption[] = [];
+        for (const m of [
+          ...data.models,
+          ...buildCustomModelOptions(passSummary?.customModels),
+          ...buildCustomModelOptions(localCustomIds),
+        ]) {
+          if (!seen.has(m.id)) {
+            seen.add(m.id);
+            mergedModels.push(m);
+          }
+        }
+
+        setModels(mergedModels);
+        if (mergedModels.length === 0) {
+          setSelectedModel('');
+          setSyncError(
+            data.gatewayMessage ||
+              'Connected via shared link, but 0 models were returned. Add model IDs in Models to continue.'
+          );
+        } else {
+          setSelectedModel((prev) =>
+            mergedModels.some((m) => m.id === prev) ? prev : mergedModels[0].id
+          );
+        }
+      } catch (err: unknown) {
+        const errWithShare = err as Error & { share?: SharedKeyLinkSummary };
+        if (errWithShare?.share) {
+          setGuestSharePass(errWithShare.share);
+        }
+        const errMessage = err instanceof Error ? err.message : 'Unable to sync models.';
+        const fallbackCustom = buildCustomModelOptions([
+          ...(errWithShare?.share?.customModels || []),
+          ...localCustomIds,
+        ]);
+        setModels(fallbackCustom);
+        if (fallbackCustom.length > 0) {
+          setSelectedModel((prev) =>
+            fallbackCustom.some((m) => m.id === prev) ? prev : fallbackCustom[0].id
+          );
+        } else {
+          setSelectedModel('');
+        }
+        setSyncError(errMessage);
+      } finally {
+        setIsSyncingModels(false);
+      }
+    },
+    [buildCustomModelOptions]
+  );
+
   const syncModelsForKey = useCallback(async (keyItem: SavedUserKey | null) => {
     if (!keyItem?.apiKey || !keyItem?.baseUrl) {
       setModels([]);
@@ -473,16 +845,6 @@ export default function App() {
       setSyncedSourceUrl(null);
       return;
     }
-
-    const buildCustomOptions = (ids?: string[]): ModelOption[] =>
-      (ids || [])
-        .map((s) => s.trim())
-        .filter(Boolean)
-        .map((id) => ({
-          id,
-          label: id,
-          ownedBy: id.includes('/') ? id.split('/')[0] : 'openai',
-        }));
 
     setIsSyncingModels(true);
     setSyncError(null);
@@ -538,7 +900,7 @@ export default function App() {
 
       const seen = new Set<string>();
       const mergedModels: ModelOption[] = [];
-      for (const m of [...data.models, ...buildCustomOptions(keyItem.customModels)]) {
+      for (const m of [...data.models, ...buildCustomModelOptions(keyItem.customModels)]) {
         if (!seen.has(m.id)) {
           seen.add(m.id);
           mergedModels.push(m);
@@ -576,7 +938,7 @@ export default function App() {
         if (fallbackData.models.length > 0) {
           const seen = new Set<string>();
           const mergedModels: ModelOption[] = [];
-          for (const m of [...fallbackData.models, ...buildCustomOptions(keyItem.customModels)]) {
+          for (const m of [...fallbackData.models, ...buildCustomModelOptions(keyItem.customModels)]) {
             if (!seen.has(m.id)) {
               seen.add(m.id);
               mergedModels.push(m);
@@ -592,7 +954,7 @@ export default function App() {
         }
       }
 
-      const fallbackCustom = buildCustomOptions(keyItem.customModels);
+      const fallbackCustom = buildCustomModelOptions(keyItem.customModels);
       setModels(fallbackCustom);
       if (fallbackCustom.length > 0) {
         setSelectedModel((prev) =>
@@ -606,33 +968,62 @@ export default function App() {
     } finally {
       setIsSyncingModels(false);
     }
-  }, []);
+  }, [buildCustomModelOptions]);
+
+  const guestCustomModelsRef = useRef<string[]>(guestCustomModels);
+  guestCustomModelsRef.current = guestCustomModels;
+
+  const syncModelsForActiveConnection = useCallback(async () => {
+    if (isGuestMode) {
+      await syncModelsForGuest(guestShareId, guestCustomModelsRef.current);
+      return;
+    }
+    await syncModelsForKey(activeKeyObj);
+  }, [isGuestMode, guestShareId, activeKeyObj, syncModelsForGuest, syncModelsForKey]);
 
   useEffect(() => {
-    syncModelsForKey(activeKeyObj);
+    if (isGuestMode) {
+      void syncModelsForGuest(guestShareId, guestCustomModelsRef.current);
+      return;
+    }
+    void syncModelsForKey(activeKeyObj);
   }, [
+    isGuestMode,
+    guestShareId,
     activeKeyObj?.id,
     activeKeyObj?.apiKey,
     activeKeyObj?.baseUrl,
     activeKeyObj?.wafCookie,
+    syncModelsForGuest,
     syncModelsForKey,
   ]);
 
   const handleTestModel = useCallback(
     async (modelId: string) => {
-      if (!activeKeyObj?.apiKey || !activeKeyObj?.baseUrl) return;
+      if (!isGuestMode && (!activeKeyObj?.apiKey || !activeKeyObj?.baseUrl)) return;
 
       setModelTests((prev) => ({
         ...prev,
         [modelId]: { status: 'testing' },
       }));
 
-      const result = await testModelOnGateway({
-        baseUrl: activeKeyObj.baseUrl,
-        rawApiKey: activeKeyObj.apiKey,
-        rawWafCookie: activeKeyObj.wafCookie,
-        model: modelId,
-      });
+      const result = isGuestMode
+        ? await testModelOnGateway({
+            baseUrl: '',
+            rawApiKey: '',
+            shareId: guestShareId,
+            onShareUpdated: (updated) => {
+              setGuestSharePass(updated);
+              setGuestPassError(null);
+            },
+            model: modelId,
+          })
+        : await testModelOnGateway({
+            baseUrl: activeKeyObj!.baseUrl,
+            rawApiKey: activeKeyObj!.apiKey,
+            rawWafCookie: activeKeyObj!.wafCookie,
+            model: modelId,
+          });
 
       if (result.ok) {
         setModelTests((prev) => ({
@@ -656,7 +1047,7 @@ export default function App() {
         }));
       }
     },
-    [activeKeyObj]
+    [isGuestMode, guestShareId, activeKeyObj]
   );
 
   const handleAddUserKey = async (
@@ -717,20 +1108,24 @@ export default function App() {
   };
 
   const handleAddCustomModels = (rawInput: string) => {
-    if (!activeKeyObj) return;
+    if (!isGuestMode && !activeKeyObj) return;
     const additions = rawInput
       .split(/[,;\n]+/)
       .map((s) => s.trim())
       .filter(Boolean);
     if (additions.length === 0) return;
 
-    setSavedKeys((prev) =>
-      prev.map((item) => {
-        if (item.id !== activeKeyObj.id) return item;
-        const merged = Array.from(new Set([...(item.customModels || []), ...additions]));
-        return { ...item, customModels: merged };
-      })
-    );
+    if (isGuestMode) {
+      setGuestCustomModels((prev) => Array.from(new Set([...prev, ...additions])));
+    } else if (activeKeyObj) {
+      setSavedKeys((prev) =>
+        prev.map((item) => {
+          if (item.id !== activeKeyObj.id) return item;
+          const merged = Array.from(new Set([...(item.customModels || []), ...additions]));
+          return { ...item, customModels: merged };
+        })
+      );
+    }
 
     setModels((prev) => {
       const seen = new Set(prev.map((m) => m.id));
@@ -755,17 +1150,21 @@ export default function App() {
   };
 
   const handleRemoveCustomModel = (modelId: string) => {
-    if (!activeKeyObj) return;
-    setSavedKeys((prev) =>
-      prev.map((item) => {
-        if (item.id !== activeKeyObj.id) return item;
-        const nextCustom = (item.customModels || []).filter((id) => id !== modelId);
-        return {
-          ...item,
-          customModels: nextCustom.length > 0 ? nextCustom : undefined,
-        };
-      })
-    );
+    if (!isGuestMode && !activeKeyObj) return;
+    if (isGuestMode) {
+      setGuestCustomModels((prev) => prev.filter((id) => id !== modelId));
+    } else if (activeKeyObj) {
+      setSavedKeys((prev) =>
+        prev.map((item) => {
+          if (item.id !== activeKeyObj.id) return item;
+          const nextCustom = (item.customModels || []).filter((id) => id !== modelId);
+          return {
+            ...item,
+            customModels: nextCustom.length > 0 ? nextCustom : undefined,
+          };
+        })
+      );
+    }
     setModels((prev) => {
       const next = prev.filter((m) => m.id !== modelId);
       if (selectedModel === modelId) {
@@ -858,10 +1257,11 @@ export default function App() {
   const selectedRole =
     allRoles.find((r) => r.id === selectedRoleId) || BUILT_IN_ROLES[0];
 
-  const openKeyModelsModal = (tab: 'models' | 'keys') => {
+  const openKeyModelsModal = useCallback((tab: ManagerTab, shareKeyId?: string) => {
     setManagerTab(tab);
+    setManagerShareKeyId(shareKeyId);
     setManagerOpen(true);
-  };
+  }, []);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
     userScrolledUpRef.current = false;
@@ -1584,7 +1984,9 @@ export default function App() {
       historyMessages: ChatMessage[],
       modelToUse: string,
       roleToUse: AgentRole,
-      userKey: SavedUserKey,
+      connection:
+        | { mode: 'guest'; shareId: string }
+        | { mode: 'key'; userKey: SavedUserKey },
       resumeTarget?: {
         msgId: string;
         existingContent: string;
@@ -1597,7 +1999,8 @@ export default function App() {
       const baseSeconds = resumeTarget?.existingSeconds || 0;
       const baseContent = resumeTarget?.existingContent || '';
       const baseThinking = resumeTarget?.existingThinking || '';
-      const useLocalOnly = isLocalOnlyBaseUrl(userKey.baseUrl);
+      const useLocalOnly =
+        connection.mode === 'key' && isLocalOnlyBaseUrl(connection.userKey.baseUrl);
       const runId = useLocalOnly
         ? undefined
         : `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
@@ -1688,6 +2091,63 @@ export default function App() {
             'Continue directly from the exact character where your previous output stopped. Do not repeat earlier code or text; finish the remaining output cleanly.',
         });
       }
+
+      if (connection.mode === 'guest') {
+        try {
+          await startBackgroundChatRun({
+            runId: runId!,
+            workspaceId,
+            conversationId: convId,
+            assistantMsgId,
+            baseUrl: '',
+            rawApiKey: '',
+            shareId: connection.shareId,
+            onShareUpdated: (updated) => {
+              setGuestSharePass(updated);
+              setGuestPassError(null);
+            },
+            model: modelToUse,
+            messages: payloadMessages,
+            systemPrompt: withThinkingInstruction(roleToUse.instructions),
+            temperature: roleToUse.temperature,
+            reasoningEffort: fastReplies ? 'low' : 'medium',
+            initialContent: baseContent,
+            initialThinking: baseThinking,
+            baseThinkingSeconds: baseSeconds,
+          });
+
+          // Never fall back to browser-direct streaming in Guest Mode so raw keys never leave the server
+          attachToBackgroundRun(convId, assistantMsgId, runId!);
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : 'Unable to start request.';
+          setConversations((prev) => {
+            const next = prev.map((c) =>
+              c.id === convId
+                ? {
+                    ...c,
+                    messages: c.messages.map((m) =>
+                      m.id === assistantMsgId
+                        ? {
+                            ...m,
+                            runId: undefined,
+                            isStreaming: false,
+                            interrupted: Boolean(baseContent.trim() || baseThinking.trim()),
+                            error: message,
+                          }
+                        : m
+                    ),
+                    updatedAt: Date.now(),
+                  }
+                : c
+            );
+            persistConversationsSnapshot(next);
+            return next;
+          });
+        }
+        return;
+      }
+
+      const { userKey } = connection;
 
       if (useLocalOnly || !runId) {
         await runDirectBrowserStreamFallback({
@@ -1787,10 +2247,16 @@ export default function App() {
 
   const handleSend = useCallback(
     (overridePrompt?: string) => {
-      if (!activeKeyObj) {
+      if (isGuestMode) {
+        if (guestPassBlockedReason) {
+          openKeyModelsModal('shares');
+          return;
+        }
+      } else if (!activeKeyObj) {
         openKeyModelsModal('keys');
         return;
       }
+
       if (!selectedModel) {
         openKeyModelsModal('models');
         return;
@@ -1844,10 +2310,15 @@ export default function App() {
         nextMessages,
         selectedModel,
         selectedRole,
-        activeKeyObj
+        isGuestMode
+          ? { mode: 'guest', shareId: guestShareId }
+          : { mode: 'key', userKey: activeKeyObj! }
       );
     },
     [
+      isGuestMode,
+      guestShareId,
+      guestPassBlockedReason,
       activeKeyObj,
       selectedModel,
       input,
@@ -1855,6 +2326,7 @@ export default function App() {
       isStreaming,
       activeConversation,
       selectedRole,
+      openKeyModelsModal,
       streamAgentResponse,
     ]
   );
@@ -1938,44 +2410,58 @@ export default function App() {
   };
 
   const handleRetryMessage = (assistantMsgIndex: number) => {
-    if (isStreaming || !activeConversation || !activeKeyObj || !selectedModel) return;
+    if (isStreaming || !activeConversation || !hasActiveConnection || !selectedModel) return;
+    if (isGuestMode && guestPassBlockedReason) {
+      openKeyModelsModal('shares');
+      return;
+    }
     stopSpeaking();
     const historyBefore = activeConversation.messages.slice(0, assistantMsgIndex);
     if (historyBefore.length === 0) return;
-    streamAgentResponse(
+    void streamAgentResponse(
       activeConversation.id,
       historyBefore,
       selectedModel,
       selectedRole,
-      activeKeyObj
+      isGuestMode
+        ? { mode: 'guest', shareId: guestShareId }
+        : { mode: 'key', userKey: activeKeyObj! }
     );
   };
 
   const handleContinueInterruptedMessage = (assistantMsgIndex: number) => {
-    if (isStreaming || !activeConversation || !activeKeyObj || !selectedModel) return;
+    if (isStreaming || !activeConversation || !hasActiveConnection || !selectedModel) return;
+    if (isGuestMode && guestPassBlockedReason) {
+      openKeyModelsModal('shares');
+      return;
+    }
     stopSpeaking();
     const targetMsg = activeConversation.messages[assistantMsgIndex];
     if (!targetMsg || targetMsg.role !== 'assistant') return;
     const historyBefore = activeConversation.messages.slice(0, assistantMsgIndex);
     if (historyBefore.length === 0) return;
 
+    const conn = isGuestMode
+      ? ({ mode: 'guest', shareId: guestShareId } as const)
+      : ({ mode: 'key', userKey: activeKeyObj! } as const);
+
     if (!targetMsg.content.trim()) {
-      streamAgentResponse(
+      void streamAgentResponse(
         activeConversation.id,
         historyBefore,
         targetMsg.model || selectedModel,
         selectedRole,
-        activeKeyObj
+        conn
       );
       return;
     }
 
-    streamAgentResponse(
+    void streamAgentResponse(
       activeConversation.id,
       historyBefore,
       targetMsg.model || selectedModel,
       selectedRole,
-      activeKeyObj,
+      conn,
       {
         msgId: targetMsg.id,
         existingContent: targetMsg.content,
@@ -2087,36 +2573,41 @@ export default function App() {
   };
 
   const handleSendSampleInboundRequest = async (promptText: string) => {
-    if (!activeKeyObj || !selectedModel) return;
+    if (!hasActiveConnection || !selectedModel) return;
     const res = await fetch(`/api/inbox?workspaceId=${encodeURIComponent(workspaceId)}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-agentrouter-key': activeKeyObj.apiKey,
-        'x-agentrouter-base-url': activeKeyObj.baseUrl,
-        ...(activeKeyObj.wafCookie
-          ? { 'x-agentrouter-cookie': activeKeyObj.wafCookie }
-          : {}),
+        ...(isGuestMode
+          ? { 'x-vellum-share-id': guestShareId }
+          : {
+              'x-agentrouter-key': activeKeyObj!.apiKey,
+              'x-agentrouter-base-url': activeKeyObj!.baseUrl,
+              ...(activeKeyObj!.wafCookie
+                ? { 'x-agentrouter-cookie': activeKeyObj!.wafCookie }
+                : {}),
+            }),
       },
       body: JSON.stringify({
         workspaceId,
         title: promptText.slice(0, 44),
         prompt: promptText,
-        sender: activeKeyObj.label,
+        sender: isGuestMode ? guestSharePass?.label || 'Shared Pass' : activeKeyObj!.label,
         model: selectedModel,
         systemPrompt: selectedRole.instructions,
         autoRun: true,
       }),
     });
-    if (res.ok) {
-      const data = await res.json().catch(() => null);
-      if (data?.task) {
-        const returnedTask: InboundAgentTask = data.task;
-        setInboxTasks((prev) => [
-          returnedTask,
-          ...prev.filter((t) => t.id !== returnedTask.id),
-        ]);
-      }
+    const data = await res.json().catch(() => null);
+    if (data?.share) {
+      setGuestSharePass(data.share as SharedKeyLinkSummary);
+    }
+    if (res.ok && data?.task) {
+      const returnedTask: InboundAgentTask = data.task;
+      setInboxTasks((prev) => [
+        returnedTask,
+        ...prev.filter((t) => t.id !== returnedTask.id),
+      ]);
     }
   };
 
@@ -2151,7 +2642,11 @@ export default function App() {
         onClose={() => setSidebarOpen(false)}
         workspaceId={workspaceId}
         activeKey={activeKeyObj}
-        onOpenKeyManager={openKeyModelsModal}
+        onOpenKeyManager={(tab) => openKeyModelsModal(tab)}
+        isGuestMode={isGuestMode}
+        guestShareId={guestShareId}
+        guestSharePass={guestSharePass}
+        sharedLinksCount={sharedLinks.length}
         conversations={conversations}
         activeId={activeConversation?.id || ''}
         onSelectConversation={(id) => {
@@ -2228,21 +2723,45 @@ export default function App() {
           <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
             <button
               type="button"
-              onClick={() => openKeyModelsModal(activeKeyObj ? 'models' : 'keys')}
-              className="min-h-[40px] px-3 sm:px-4 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+              onClick={() => openKeyModelsModal(hasActiveConnection ? 'models' : 'keys')}
+              className="min-h-[40px] px-2.5 sm:px-4 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-semibold text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 tabular-nums"
             >
-              {activeKeyObj ? (
+              {hasActiveConnection ? (
                 <>
-                  <SlidersHorizontal className="w-3.5 h-3.5" />
-                  <span>Models ({models.length})</span>
+                  <SlidersHorizontal className="w-3.5 h-3.5 shrink-0" />
+                  <span className="hidden sm:inline">Models ({models.length})</span>
+                  <span className="sm:hidden">{models.length}</span>
                 </>
               ) : (
                 <>
-                  <KeyRound className="w-3.5 h-3.5" />
+                  <KeyRound className="w-3.5 h-3.5 shrink-0" />
                   <span>Base API</span>
                 </>
               )}
             </button>
+
+            {isGuestMode ? (
+              <button
+                type="button"
+                onClick={() => openKeyModelsModal('shares')}
+                className="min-h-[40px] px-3 sm:px-3.5 rounded-full border border-foreground/20 hover:bg-foreground/5 text-xs font-mono font-semibold text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+              >
+                <Link2 className="w-3.5 h-3.5 shrink-0" />
+                <span>Pass</span>
+              </button>
+            ) : activeKeyObj ? (
+              <button
+                type="button"
+                onClick={() => openKeyModelsModal('shares', activeKeyObj.id)}
+                title="Create or manage disguised key links"
+                className="min-h-[40px] px-3 sm:px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-semibold text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 tabular-nums"
+              >
+                <Link2 className="w-3.5 h-3.5 shrink-0" />
+                <span>
+                  Share{sharedLinks.length > 0 ? ` (${sharedLinks.length})` : ''}
+                </span>
+              </button>
+            ) : null}
 
             {allConversationArtifacts.length > 0 && (
               <button
@@ -2252,7 +2771,7 @@ export default function App() {
                     curr ? null : allConversationArtifacts[allConversationArtifacts.length - 1]
                   )
                 }
-                className="min-h-[40px] px-3 sm:px-4 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+                className="min-h-[40px] px-2.5 sm:px-4 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-semibold text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
               >
                 <Layers className="w-3.5 h-3.5" />
                 <span className="hidden sm:inline">
@@ -2275,7 +2794,7 @@ export default function App() {
                   ? 'Sticky Scroll: On — auto-scrolls with replies'
                   : 'Sticky Scroll: Off — stays put while reading'
               }
-              className={`min-h-[40px] min-w-[40px] md:px-3.5 rounded-full border text-xs font-mono font-medium flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
+              className={`hidden sm:flex min-h-[40px] min-w-[40px] md:px-3.5 rounded-full border text-xs font-mono font-medium items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
                 stickyScroll
                   ? 'border-foreground/30 bg-foreground/[0.07] text-foreground'
                   : 'border-foreground/15 text-muted-foreground hover:text-foreground hover:bg-foreground/5'
@@ -2293,7 +2812,7 @@ export default function App() {
                 onClick={handleInstallClick}
                 aria-label="Install Vellum app"
                 title="Install Vellum app"
-                className="min-h-[40px] min-w-[40px] lg:px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-medium text-foreground flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+                className="hidden md:flex min-h-[40px] min-w-[40px] lg:px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-medium text-foreground items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
               >
                 <Download className="w-3.5 h-3.5 shrink-0" />
                 <span className="hidden lg:inline">Install</span>
@@ -2314,13 +2833,73 @@ export default function App() {
               type="button"
               onClick={handleNewChat}
               aria-label="Start new chat"
-              className="min-h-[40px] px-4 sm:px-5 rounded-full bg-foreground hover:bg-foreground/90 text-background text-xs font-medium flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+              className="min-h-[40px] min-w-[40px] px-3 sm:px-5 rounded-full bg-foreground hover:bg-foreground/90 text-background text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
             >
               <Plus className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">New chat</span>
             </button>
           </div>
         </header>
+
+        {isGuestMode && (
+          <div
+            className={`px-3 sm:px-6 py-2 border-b flex flex-wrap items-center justify-between gap-2 text-xs font-mono tabular-nums shrink-0 ${
+              guestPassBlockedReason
+                ? 'border-destructive/35 bg-destructive/5 text-destructive'
+                : 'border-foreground/12 bg-foreground/[0.025] text-foreground'
+            }`}
+          >
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 min-w-0">
+              <Link2 className="w-3.5 h-3.5 shrink-0" />
+              {guestPassBlockedReason ? (
+                <span className="font-semibold">{guestPassBlockedReason}</span>
+              ) : guestSharePass ? (
+                <>
+                  <span className="font-bold truncate max-w-[160px] sm:max-w-[240px]">
+                    {guestSharePass.label}
+                  </span>
+                  <span aria-hidden="true" className="text-muted-foreground">
+                    ·
+                  </span>
+                  <span className="font-semibold">
+                    {guestSharePass.maxMessages !== null
+                      ? `${guestSharePass.usedMessages}/${guestSharePass.maxMessages} msgs`
+                      : `${guestSharePass.usedMessages} msgs`}
+                  </span>
+                  <span aria-hidden="true" className="text-muted-foreground">
+                    ·
+                  </span>
+                  <span className="text-muted-foreground">
+                    {formatShareRemainingTime(guestSharePass.expiresAt)}
+                  </span>
+                  <span aria-hidden="true" className="hidden sm:inline text-muted-foreground">
+                    ·
+                  </span>
+                  <span className="hidden sm:inline text-muted-foreground">Key hidden</span>
+                </>
+              ) : (
+                <span className="text-muted-foreground">Connecting shared link...</span>
+              )}
+            </div>
+
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => openKeyModelsModal('shares')}
+                className="min-h-[36px] px-3 rounded-full border border-foreground/15 hover:bg-foreground/5 text-[11px] font-mono font-semibold text-foreground transition-colors whitespace-nowrap shrink-0"
+              >
+                Pass Details
+              </button>
+              <button
+                type="button"
+                onClick={handleExitGuestMode}
+                className="min-h-[36px] px-3 rounded-full bg-foreground hover:bg-foreground/90 text-background text-[11px] font-sans font-semibold transition-colors whitespace-nowrap shrink-0"
+              >
+                {savedKeys.length > 0 ? 'Switch to My Key' : 'Use Own Key'}
+              </button>
+            </div>
+          </div>
+        )}
 
         {!isOnline && (
           <div className="px-4 py-2 border-b border-foreground/15 bg-foreground/[0.04] flex items-center justify-center gap-2 text-xs font-medium text-foreground shrink-0">
@@ -2335,12 +2914,12 @@ export default function App() {
           ref={scrollContainerRef}
           onScroll={handleStageScroll}
           className={`flex-1 overflow-y-auto px-4 sm:px-8 ${
-            !activeKeyObj || !activeConversation || activeConversation.messages.length === 0
+            !hasActiveConnection || !activeConversation || activeConversation.messages.length === 0
               ? 'optimus-grid'
               : ''
           }`}
         >
-          {!activeKeyObj ? (
+          {!hasActiveConnection ? (
             /* Step 1 Onboarding: Optimus Editorial Grid + Manual Base API & Key Form */
             <div className="max-w-2xl mx-auto min-h-full flex flex-col justify-center py-10 sm:py-16 animate-optimus-in">
               <div className="mb-8 sm:mb-10">
@@ -2361,7 +2940,7 @@ export default function App() {
                 </h1>
 
                 <p className="text-base sm:text-lg text-muted-foreground leading-relaxed mt-5 max-w-xl">
-                  Enter your Base API URL and personal key manually to sync models from your endpoint, test response times, and stream in real time.
+                  Enter your Base API URL and personal key manually to sync models from your endpoint, test response times, and create disguised share links whenever you want.
                 </p>
               </div>
 
@@ -2468,7 +3047,7 @@ export default function App() {
                         className="w-full min-h-[44px] px-4 bg-foreground/[0.02] border border-foreground/15 text-[16px] sm:text-xs font-mono text-foreground placeholder:font-sans placeholder:text-muted-foreground focus:outline-none focus:border-foreground/50 transition-colors"
                       />
                       <p className="text-[11px] text-muted-foreground leading-relaxed">
-                        Not needed on mobile. Leave blank unless you want to forward a custom desktop Cookie header.
+                        Not needed on mobile for personal use. Useful if you plan to share an agentrouter.org link.
                       </p>
                     </div>
                   )}
@@ -2478,7 +3057,7 @@ export default function App() {
                   <button
                     type="submit"
                     disabled={!inlineBaseUrl.trim() || !inlineKeyInput.trim()}
-                    className="w-full h-13 px-8 rounded-full bg-foreground hover:bg-foreground/90 text-background text-sm sm:text-base font-medium flex items-center justify-center gap-2 disabled:opacity-30 transition-all group"
+                    className="w-full h-13 px-8 rounded-full bg-foreground hover:bg-foreground/90 text-background text-sm sm:text-base font-semibold flex items-center justify-center gap-2 disabled:opacity-30 transition-all group"
                   >
                     <span>Save & Sync Models</span>
                     <ArrowRight className="w-4 h-4 group-hover:translate-x-1 transition-transform" />
@@ -2514,10 +3093,14 @@ export default function App() {
                   ) : (
                     <button
                       type="button"
-                      onClick={() => openKeyModelsModal('keys')}
+                      onClick={() => openKeyModelsModal(isGuestMode ? 'shares' : 'keys')}
                       className="text-destructive underline underline-offset-4"
                     >
-                      {syncError || 'No models synced — check Base API & key'}
+                      {syncError ||
+                        guestPassBlockedReason ||
+                        (isGuestMode
+                          ? 'No models synced — check shared pass'
+                          : 'No models synced — check Base API & key')}
                     </button>
                   )}
                 </div>
@@ -2535,8 +3118,8 @@ export default function App() {
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => syncModelsForKey(activeKeyObj)}
-                      className="min-h-[44px] px-4 rounded-full border border-foreground/20 hover:bg-foreground/5 text-xs font-mono font-medium text-foreground flex items-center gap-1.5"
+                      onClick={() => void syncModelsForActiveConnection()}
+                      className="min-h-[44px] px-4 rounded-full border border-foreground/20 hover:bg-foreground/5 text-xs font-mono font-semibold text-foreground flex items-center gap-1.5 whitespace-nowrap"
                     >
                       <RefreshCw className="w-3.5 h-3.5" />
                       <span>Retry Sync</span>
@@ -2544,11 +3127,21 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() =>
-                        openKeyModelsModal(/0 models/i.test(syncError) ? 'models' : 'keys')
+                        openKeyModelsModal(
+                          /0 models/i.test(syncError)
+                            ? 'models'
+                            : isGuestMode
+                              ? 'shares'
+                              : 'keys'
+                        )
                       }
-                      className="min-h-[44px] px-4 rounded-full bg-foreground text-background text-xs font-semibold"
+                      className="min-h-[44px] px-4 rounded-full bg-foreground text-background text-xs font-semibold whitespace-nowrap"
                     >
-                      {/0 models/i.test(syncError) ? 'Add Model IDs' : 'Edit Base API'}
+                      {/0 models/i.test(syncError)
+                        ? 'Add Model IDs'
+                        : isGuestMode
+                          ? 'Pass Details'
+                          : 'Edit Base API'}
                     </button>
                   </div>
                 </div>
@@ -2715,27 +3308,38 @@ export default function App() {
                           <div className="font-mono text-xs font-semibold text-destructive break-words">
                             {msg.error}
                           </div>
-                          {isAuthKeyErrorString(msg.error) && (
+                          {!isGuestMode && isAuthKeyErrorString(msg.error) && (
                             <p className="text-xs text-muted-foreground leading-relaxed">
                               Make sure your API key matches your selected Base API URL (keys from agentrouter.org and co.agentrouter.org are separate) and has no extra characters.
                             </p>
                           )}
                         </div>
                         <div className="flex flex-wrap items-center gap-2 shrink-0">
-                          {isAuthKeyErrorString(msg.error) && (
+                          {isGuestMode ? (
                             <button
                               type="button"
-                              onClick={() => openKeyModelsModal('keys')}
-                              className="min-h-[38px] px-3.5 rounded-full bg-foreground text-background text-xs font-semibold flex items-center gap-1.5 hover:bg-foreground/90 transition-colors"
+                              onClick={() => openKeyModelsModal('shares')}
+                              className="min-h-[38px] px-3.5 rounded-full bg-foreground text-background text-xs font-semibold flex items-center gap-1.5 hover:bg-foreground/90 transition-colors whitespace-nowrap"
                             >
-                              <KeyRound className="w-3.5 h-3.5" />
-                              <span>Check API Key</span>
+                              <Link2 className="w-3.5 h-3.5" />
+                              <span>Pass Details</span>
                             </button>
+                          ) : (
+                            isAuthKeyErrorString(msg.error) && (
+                              <button
+                                type="button"
+                                onClick={() => openKeyModelsModal('keys')}
+                                className="min-h-[38px] px-3.5 rounded-full bg-foreground text-background text-xs font-semibold flex items-center gap-1.5 hover:bg-foreground/90 transition-colors whitespace-nowrap"
+                              >
+                                <KeyRound className="w-3.5 h-3.5" />
+                                <span>Check API Key</span>
+                              </button>
+                            )
                           )}
                           <button
                             type="button"
                             onClick={() => handleRetryMessage(index)}
-                            className="min-h-[38px] px-3.5 rounded-full border border-foreground/20 hover:bg-foreground/5 text-xs font-semibold text-foreground flex items-center gap-1.5 transition-colors"
+                            className="min-h-[38px] px-3.5 rounded-full border border-foreground/20 hover:bg-foreground/5 text-xs font-semibold text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap"
                           >
                             <RotateCcw className="w-3.5 h-3.5" />
                             <span>Retry</span>
@@ -2857,7 +3461,7 @@ export default function App() {
           )}
         </div>
 
-        {showJumpToBottom && activeKeyObj && Boolean(activeConversation?.messages.length) && (
+        {showJumpToBottom && hasActiveConnection && Boolean(activeConversation?.messages.length) && (
           <div className="pointer-events-none absolute bottom-3 left-0 right-0 flex justify-center px-4 z-10">
             <button
               type="button"
@@ -2879,7 +3483,9 @@ export default function App() {
           onSend={() => handleSend()}
           onStop={handleStop}
           isStreaming={isStreaming}
-          hasActiveKey={Boolean(activeKeyObj)}
+          hasActiveKey={hasActiveConnection}
+          isGuestMode={isGuestMode}
+          guestPassBlockedReason={guestPassBlockedReason}
           attachments={attachments}
           onAddAttachments={(added) => setAttachments((prev) => [...prev, ...added])}
           onRemoveAttachment={(id) => setAttachments((prev) => prev.filter((a) => a.id !== id))}
@@ -2889,8 +3495,8 @@ export default function App() {
           modelTests={modelTests}
           onTestModel={handleTestModel}
           isSyncingModels={isSyncingModels}
-          onSyncModels={() => syncModelsForKey(activeKeyObj)}
-          onOpenModelsManager={openKeyModelsModal}
+          onSyncModels={syncModelsForActiveConnection}
+          onOpenModelsManager={(tab) => openKeyModelsModal(tab)}
           roles={allRoles}
           selectedRole={selectedRole}
           onSelectRole={(roleId) => setSelectedRoleId(roleId)}
@@ -2905,10 +3511,11 @@ export default function App() {
         onClose={() => setActiveArtifact(null)}
       />
 
-      {/* Base API, Keys & Live Synced Models Test Sheet */}
+      {/* Base API, Keys, Disguised Share Links & Live Synced Models Test Sheet */}
       <KeyModelsModal
         isOpen={managerOpen}
         initialTab={managerTab}
+        initialShareKeyId={managerShareKeyId}
         onClose={() => setManagerOpen(false)}
         savedKeys={savedKeys}
         activeKeyId={activeKeyObj?.id || ''}
@@ -2925,12 +3532,26 @@ export default function App() {
         isSyncing={isSyncingModels}
         syncError={syncError}
         syncedSourceUrl={syncedSourceUrl}
-        onSyncModels={() => syncModelsForKey(activeKeyObj)}
+        onSyncModels={syncModelsForActiveConnection}
         modelTests={modelTests}
         onTestModel={handleTestModel}
-        customModels={activeKeyObj?.customModels || []}
+        customModels={isGuestMode ? guestCustomModels : activeKeyObj?.customModels || []}
         onAddCustomModels={handleAddCustomModels}
         onRemoveCustomModel={handleRemoveCustomModel}
+        isGuestMode={isGuestMode}
+        guestShareId={guestShareId}
+        guestSharePass={guestSharePass}
+        guestPassError={guestPassError}
+        isRefreshingGuestPass={isRefreshingGuestPass}
+        onRefreshGuestPass={handleRefreshGuestPass}
+        onExitGuestMode={handleExitGuestMode}
+        hasPersonalKeys={savedKeys.length > 0}
+        sharedLinks={sharedLinks}
+        isLoadingShares={isLoadingShares}
+        onRefreshShares={refreshOwnerShares}
+        onCreateShareLink={handleCreateShareLink}
+        onToggleRevokeShareLink={handleToggleRevokeShareLink}
+        onDeleteShareLink={handleDeleteShareLink}
       />
 
       {/* Install App Guide Modal (iOS Safari / Browser Fallback) */}

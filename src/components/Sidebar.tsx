@@ -6,6 +6,7 @@ import {
   Copy,
   Download,
   KeyRound,
+  Link2,
   Loader2,
   Moon,
   Plus,
@@ -14,14 +15,25 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { AgentRole, Conversation, InboundAgentTask, SavedUserKey } from '../types';
+import {
+  AgentRole,
+  Conversation,
+  InboundAgentTask,
+  ManagerTab,
+  SavedUserKey,
+  SharedKeyLinkSummary,
+} from '../types';
 
 interface SidebarProps {
   isOpen: boolean;
   onClose: () => void;
   workspaceId: string;
   activeKey: SavedUserKey | null;
-  onOpenKeyManager: (tab: 'models' | 'keys') => void;
+  onOpenKeyManager: (tab: ManagerTab) => void;
+  isGuestMode?: boolean;
+  guestShareId?: string;
+  guestSharePass?: SharedKeyLinkSummary | null;
+  sharedLinksCount?: number;
   conversations: Conversation[];
   activeId: string;
   onSelectConversation: (id: string) => void;
@@ -51,6 +63,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
   workspaceId,
   activeKey,
   onOpenKeyManager,
+  isGuestMode = false,
+  guestShareId = '',
+  guestSharePass = null,
+  sharedLinksCount = 0,
   conversations,
   activeId,
   onSelectConversation,
@@ -108,19 +124,28 @@ export const Sidebar: React.FC<SidebarProps> = ({
     setAddingRole(false);
   };
 
+  const hasReadyConnection = isGuestMode
+    ? Boolean(guestShareId) && (!guestSharePass || guestSharePass.effectiveStatus === 'active')
+    : Boolean(activeKey);
+
   const handleCopyCurl = async () => {
     const origin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
     const modelArg = selectedModel || 'YOUR_SYNCED_MODEL_ID';
-    const baseArg = activeKey?.baseUrl || 'YOUR_BASE_API_URL';
-    const cmd = `curl -X POST "${origin}/api/inbox?workspaceId=${workspaceId}" -H "Content-Type: application/json" -H "x-agentrouter-base-url: ${baseArg}" -H "Authorization: Bearer YOUR_API_KEY" -d '{"title":"Daily Brief","prompt":"Summarize three practical ways to speed up web page loads.","model":"${modelArg}"}'`;
-    await navigator.clipboard.writeText(cmd);
+    if (isGuestMode && guestShareId) {
+      const cmd = `curl -X POST "${origin}/api/inbox?workspaceId=${workspaceId}" -H "Content-Type: application/json" -H "x-vellum-share-id: ${guestShareId}" -d '{"title":"Daily Brief","prompt":"Summarize three practical ways to speed up web page loads.","model":"${modelArg}"}'`;
+      await navigator.clipboard.writeText(cmd);
+    } else {
+      const baseArg = activeKey?.baseUrl || 'YOUR_BASE_API_URL';
+      const cmd = `curl -X POST "${origin}/api/inbox?workspaceId=${workspaceId}" -H "Content-Type: application/json" -H "x-agentrouter-base-url: ${baseArg}" -H "Authorization: Bearer YOUR_API_KEY" -d '{"title":"Daily Brief","prompt":"Summarize three practical ways to speed up web page loads.","model":"${modelArg}"}'`;
+      await navigator.clipboard.writeText(cmd);
+    }
     setCopiedCurl(true);
     setTimeout(() => setCopiedCurl(false), 1800);
   };
 
   const handleDispatchInbound = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inboundPrompt.trim() || submittingInbound || !activeKey || !selectedModel) return;
+    if (!inboundPrompt.trim() || submittingInbound || !hasReadyConnection || !selectedModel) return;
     setSubmittingInbound(true);
     try {
       await onSendSampleInboundRequest(inboundPrompt.trim());
@@ -337,7 +362,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 </div>
 
                 <p className="text-xs text-muted-foreground leading-relaxed">
-                  Post tasks to <code className="font-mono text-foreground">/api/inbox</code> with your key and synced model ID to stream results straight into your workspace.
+                  Post tasks to <code className="font-mono text-foreground">/api/inbox</code>{' '}
+                  {isGuestMode
+                    ? 'with your shared link ID and synced model to stream results into your workspace.'
+                    : 'with your key and synced model ID to stream results straight into your workspace.'}
                 </p>
 
                 <form onSubmit={handleDispatchInbound} className="pt-1 flex gap-2">
@@ -346,19 +374,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     value={inboundPrompt}
                     onChange={(e) => setInboundPrompt(e.target.value)}
                     placeholder={
-                      activeKey && selectedModel
+                      hasReadyConnection && selectedModel
                         ? 'Queue a background task...'
-                        : 'Add key & sync model first'
+                        : isGuestMode
+                          ? 'Sync a model first'
+                          : 'Add key & sync model first'
                     }
-                    disabled={!activeKey || !selectedModel}
+                    disabled={!hasReadyConnection || !selectedModel}
                     className="flex-1 min-w-0 min-h-[42px] px-3 bg-background border border-foreground/15 text-base sm:text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:border-foreground/40 disabled:opacity-50"
                   />
                   <button
                     type="submit"
                     disabled={
-                      !inboundPrompt.trim() || submittingInbound || !activeKey || !selectedModel
+                      !inboundPrompt.trim() ||
+                      submittingInbound ||
+                      !hasReadyConnection ||
+                      !selectedModel
                     }
-                    className="min-h-[42px] px-4 rounded-full bg-foreground text-background text-xs font-medium disabled:opacity-40 whitespace-nowrap shrink-0"
+                    className="min-h-[42px] px-4 rounded-full bg-foreground text-background text-xs font-semibold disabled:opacity-40 whitespace-nowrap shrink-0"
                   >
                     Run
                   </button>
@@ -585,21 +618,58 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </span>
           </button>
 
+          {!isGuestMode && activeKey && (
+            <button
+              type="button"
+              onClick={() => {
+                onOpenKeyManager('shares');
+                if (window.innerWidth < 1024) onClose();
+              }}
+              className="w-full min-h-[44px] px-3.5 rounded-2xl border border-foreground/15 hover:bg-foreground/[0.04] flex items-center justify-between gap-3 transition-colors text-left"
+            >
+              <span className="flex items-center gap-2.5 min-w-0">
+                <Link2 className="w-4 h-4 shrink-0 text-muted-foreground" />
+                <span className="min-w-0">
+                  <span className="block text-xs font-bold tracking-tight text-foreground">
+                    Disguised Share Links {sharedLinksCount > 0 ? `(${sharedLinksCount})` : ''}
+                  </span>
+                  <span className="block text-[11px] text-muted-foreground truncate">
+                    Share access without showing your key
+                  </span>
+                </span>
+              </span>
+              <ArrowUpRight className="w-4 h-4 shrink-0 text-muted-foreground" />
+            </button>
+          )}
+
           <div className="flex items-center justify-between gap-2">
             <button
               type="button"
-              onClick={() => onOpenKeyManager('keys')}
-              className="min-h-[44px] px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-semibold text-foreground flex items-center gap-2 transition-colors min-w-0 flex-1"
+              onClick={() => {
+                onOpenKeyManager(isGuestMode ? 'shares' : 'keys');
+                if (window.innerWidth < 1024) onClose();
+              }}
+              className="min-h-[44px] px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-bold text-foreground flex items-center gap-2 transition-colors min-w-0 flex-1"
             >
-              <KeyRound className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
-              <span className="truncate">{activeKey ? activeKey.label : 'Set Base API & Key'}</span>
+              {isGuestMode ? (
+                <Link2 className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
+              ) : (
+                <KeyRound className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
+              )}
+              <span className="truncate">
+                {isGuestMode
+                  ? guestSharePass?.label || 'Shared Pass'
+                  : activeKey
+                    ? activeKey.label
+                    : 'Set Base API & Key'}
+              </span>
             </button>
 
             <button
               type="button"
               onClick={onToggleDarkMode}
               aria-label="Toggle light and dark mode"
-              className="min-h-[44px] px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-medium text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+              className="min-h-[44px] px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-semibold text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
             >
               {darkMode ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
               <span>{darkMode ? 'Light' : 'Dark'}</span>

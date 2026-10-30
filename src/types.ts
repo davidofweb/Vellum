@@ -85,6 +85,24 @@ export interface SavedUserKey {
   customModels?: string[];
 }
 
+export type ManagerTab = 'models' | 'keys' | 'shares';
+
+export type SharedLinkStatus = 'active' | 'revoked' | 'expired' | 'exhausted';
+
+export interface SharedKeyLinkSummary {
+  shareId: string;
+  label: string;
+  status: 'active' | 'revoked';
+  effectiveStatus: SharedLinkStatus;
+  hostHint: string;
+  customModels: string[];
+  createdAt: number;
+  expiresAt: number | null;
+  maxMessages: number | null;
+  usedMessages: number;
+  lastUsedAt: number | null;
+}
+
 export interface InboundAgentTask {
   id: string;
   workspaceId?: string;
