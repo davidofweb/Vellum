@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { Check, Copy, Maximize2 } from 'lucide-react';
+import { Check, Copy, Maximize2 } from './RareIcons';
 import { ArtifactItem } from '../types';
 
 interface MarkdownRendererProps {

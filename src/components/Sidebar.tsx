@@ -14,7 +14,7 @@ import {
   Sun,
   Trash2,
   X,
-} from 'lucide-react';
+} from './RareIcons';
 import {
   AgentRole,
   Conversation,

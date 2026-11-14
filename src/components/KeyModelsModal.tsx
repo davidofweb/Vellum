@@ -20,7 +20,7 @@ import {
   Square,
   Trash2,
   X,
-} from 'lucide-react';
+} from './RareIcons';
 import {
   ManagerTab,
   ModelOption,

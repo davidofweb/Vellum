@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Check, Copy, Download, X } from 'lucide-react';
+import { Check, Copy, Download, X } from './RareIcons';
 import { ArtifactItem } from '../types';
 import { getFileExtension } from '../utils/artifacts';
 

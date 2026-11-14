@@ -28,7 +28,7 @@ import {
   Sun,
   Volume2,
   WifiOff,
-} from 'lucide-react';
+} from './components/RareIcons';
 import {
   AgentRole,
   ArtifactItem,
@@ -523,6 +523,25 @@ export default function App() {
       // Ignore
     }
   }, []);
+
+  useEffect(() => {
+    const flushNow = () => {
+      persistConversationsSnapshot(conversationsRef.current);
+    };
+    const handleVisibilityFlush = () => {
+      if (document.visibilityState === 'hidden') {
+        flushNow();
+      }
+    };
+    window.addEventListener('pagehide', flushNow);
+    window.addEventListener('beforeunload', flushNow);
+    document.addEventListener('visibilitychange', handleVisibilityFlush);
+    return () => {
+      window.removeEventListener('pagehide', flushNow);
+      window.removeEventListener('beforeunload', flushNow);
+      document.removeEventListener('visibilitychange', handleVisibilityFlush);
+    };
+  }, [persistConversationsSnapshot]);
 
   useEffect(() => {
     if (!anyConversationStreaming) {
@@ -1922,15 +1941,15 @@ export default function App() {
 
   const reconcileWorkspaceRuns = useCallback(async () => {
     if (reconcilingRunsRef.current) return;
-    const hasTrackedMessages = conversationsRef.current.some((c) =>
-      c.messages.some((m) => Boolean(m.runId) && (m.isStreaming || m.interrupted))
-    );
-    if (!hasTrackedMessages) return;
+    if (conversationsRef.current.length === 0) return;
 
     reconcilingRunsRef.current = true;
     try {
       const serverRuns = await fetchWorkspaceChatRuns(workspaceId);
       const runsById = new Map(serverRuns.map((r) => [r.runId, r]));
+      const runsByMsgKey = new Map(
+        serverRuns.map((r) => [`${r.conversationId}:${r.assistantMsgId}`, r])
+      );
 
       const missingStreamingTargets: Array<{ convId: string; msgId: string; runId: string }> =
         [];
@@ -1938,8 +1957,10 @@ export default function App() {
       for (const conv of conversationsRef.current) {
         if (localStreamControllersRef.current.has(conv.id)) continue;
         for (const msg of conv.messages) {
-          if (!msg.runId) continue;
-          const serverRun = runsById.get(msg.runId);
+          if (msg.role !== 'assistant') continue;
+          const serverRun =
+            (msg.runId ? runsById.get(msg.runId) : undefined) ||
+            runsByMsgKey.get(`${conv.id}:${msg.id}`);
           if (serverRun) {
             const shouldApply =
               msg.isStreaming ||
@@ -1953,7 +1974,7 @@ export default function App() {
             if (serverRun.status === 'running') {
               attachToBackgroundRun(conv.id, msg.id, serverRun.runId);
             }
-          } else if (msg.isStreaming) {
+          } else if (msg.isStreaming && msg.runId) {
             missingStreamingTargets.push({
               convId: conv.id,
               msgId: msg.id,
@@ -2030,6 +2051,16 @@ export default function App() {
       window.removeEventListener('online', handleResumeSync);
     };
   }, [reconcileWorkspaceRuns]);
+
+  useEffect(() => {
+    if (!anyConversationStreaming) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        void reconcileWorkspaceRuns();
+      }
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [anyConversationStreaming, reconcileWorkspaceRuns]);
 
   const streamAgentResponse = useCallback(
     async (

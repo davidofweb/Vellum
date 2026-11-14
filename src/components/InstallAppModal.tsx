@@ -1,5 +1,5 @@
 import React from 'react';
-import { Download, Share, Smartphone, X } from 'lucide-react';
+import { Download, Share, Smartphone, X } from './RareIcons';
 
 interface InstallAppModalProps {
   isOpen: boolean;

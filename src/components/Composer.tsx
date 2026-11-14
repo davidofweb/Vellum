@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect, useLayoutEffect, useCallback } from 'react';
 import {
   ArrowUp,
   Check,
@@ -11,7 +11,7 @@ import {
   Square,
   X,
   Zap,
-} from 'lucide-react';
+} from './RareIcons';
 import { AgentRole, Attachment, ManagerTab, ModelOption, ModelTestResult } from '../types';
 import { isReasoningStyleModel } from '../utils/gateway';
 
@@ -41,6 +41,9 @@ interface ComposerProps {
   fastReplies: boolean;
   onToggleFastReplies: () => void;
 }
+
+const COMPACT_MIN_HEIGHT = 40;
+const EXPANDED_MAX_HEIGHT = 220;
 
 export const Composer: React.FC<ComposerProps> = ({
   input,
@@ -75,12 +78,35 @@ export const Composer: React.FC<ComposerProps> = ({
   const [showRoleSheet, setShowRoleSheet] = useState(false);
   const [quickFilter, setQuickFilter] = useState('');
 
-  useEffect(() => {
+  const syncTextareaHeight = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
-    el.style.height = 'auto';
-    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-  }, [input]);
+    el.style.height = '0px';
+    const nextHeight = Math.min(
+      Math.max(el.scrollHeight, COMPACT_MIN_HEIGHT),
+      EXPANDED_MAX_HEIGHT
+    );
+    el.style.height = `${nextHeight}px`;
+    el.style.overflowY = el.scrollHeight > EXPANDED_MAX_HEIGHT ? 'auto' : 'hidden';
+  }, []);
+
+  useLayoutEffect(() => {
+    syncTextareaHeight();
+  }, [input, syncTextareaHeight]);
+
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    let lastWidth = el.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (el.clientWidth !== lastWidth) {
+        lastWidth = el.clientWidth;
+        syncTextareaHeight();
+      }
+    });
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [syncTextareaHeight]);
 
   const canSend =
     hasActiveKey &&
@@ -160,7 +186,7 @@ export const Composer: React.FC<ComposerProps> = ({
           </div>
         )}
 
-        {/* Textarea (16px font prevents mobile browser zoom) */}
+        {/* Auto-resizing textarea (16px font prevents mobile browser zoom) */}
         <textarea
           ref={textareaRef}
           rows={1}
@@ -176,7 +202,8 @@ export const Composer: React.FC<ComposerProps> = ({
                   ? 'Sync and pick a model below to start writing...'
                   : `Message ${selectedRole.name}...`
           }
-          className="w-full max-h-[200px] px-4 sm:px-5 pt-3.5 pb-2 bg-transparent text-[16px] font-medium leading-relaxed text-foreground placeholder:font-normal placeholder:text-muted-foreground focus:outline-none resize-none"
+          style={{ minHeight: `${COMPACT_MIN_HEIGHT}px`, maxHeight: `${EXPANDED_MAX_HEIGHT}px` }}
+          className="w-full px-4 sm:px-5 pt-2.5 pb-1.5 bg-transparent text-[16px] font-medium leading-[1.45] text-foreground placeholder:font-normal placeholder:text-muted-foreground focus:outline-none resize-none overflow-hidden transition-[height] duration-100 ease-out"
         />
 
         {/* Bottom Action Toolbar */}
