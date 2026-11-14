@@ -381,9 +381,67 @@ export default function App() {
   } = usePWAInstall();
   const isOnline = useOnlineStatus();
 
+  const [activeView, setActiveView] = useState<'chat' | 'sharing' | 'settings'>(() => {
+    if (typeof window !== 'undefined') {
+      const hash = window.location.hash;
+      if (hash === '#sharing') return 'sharing';
+      if (hash === '#settings') return 'settings';
+    }
+    return 'chat';
+  });
+
   const [managerOpen, setManagerOpen] = useState(false);
   const [managerTab, setManagerTab] = useState<ManagerTab>('models');
   const [managerShareKeyId, setManagerShareKeyId] = useState<string | undefined>(undefined);
+
+  useEffect(() => {
+    const handleHashChange = () => {
+      const hash = window.location.hash;
+      if (hash === '#sharing') {
+        setActiveView('sharing');
+        setManagerTab('shares');
+        setManagerOpen(true);
+      } else if (hash === '#settings') {
+        setActiveView('settings');
+        setManagerTab('models');
+        setManagerOpen(true);
+      } else {
+        setActiveView('chat');
+        setManagerOpen(false);
+      }
+    };
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, []);
+
+  const navigateToView = useCallback((view: 'chat' | 'sharing' | 'settings') => {
+    setActiveView(view);
+    if (view === 'chat') {
+      window.location.hash = '';
+      setManagerOpen(false);
+    } else if (view === 'sharing') {
+      window.location.hash = 'sharing';
+      setManagerTab('shares');
+      setManagerOpen(true);
+    } else if (view === 'settings') {
+      window.location.hash = 'settings';
+      setManagerTab('models');
+      setManagerOpen(true);
+    }
+  }, []);
+
+  const openKeyModelsModal = useCallback((tab: ManagerTab, shareKeyId?: string) => {
+    setManagerTab(tab);
+    setManagerShareKeyId(shareKeyId);
+    setManagerOpen(true);
+    if (tab === 'shares') {
+      setActiveView('sharing');
+      window.location.hash = 'sharing';
+    } else {
+      setActiveView('settings');
+      window.location.hash = 'settings';
+    }
+  }, []);
 
   const [inlineLabel, setInlineLabel] = useState('');
   const [inlineBaseUrl, setInlineBaseUrl] = useState('https://agentrouter.org/v1');
@@ -1257,11 +1315,6 @@ export default function App() {
   const selectedRole =
     allRoles.find((r) => r.id === selectedRoleId) || BUILT_IN_ROLES[0];
 
-  const openKeyModelsModal = useCallback((tab: ManagerTab, shareKeyId?: string) => {
-    setManagerTab(tab);
-    setManagerShareKeyId(shareKeyId);
-    setManagerOpen(true);
-  }, []);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
     userScrolledUpRef.current = false;
@@ -2280,9 +2333,10 @@ export default function App() {
 
       const nextMessages = [...activeConversation.messages, userMessage];
       const isFirstMessage = activeConversation.messages.length === 0;
-      const cleanTitleSource = text || attachments[0]?.name || 'New chat';
+      const cleanTitleSource = text || attachments[0]?.name || 'New task';
+      const taskSnippet = cleanTitleSource.replace(/\s+/g, ' ').slice(0, 42);
       const nextTitle = isFirstMessage
-        ? cleanTitleSource.replace(/\s+/g, ' ').slice(0, 46)
+        ? `Task: ${taskSnippet}`
         : activeConversation.title;
 
       setConversations((prev) =>
@@ -2705,139 +2759,16 @@ export default function App() {
               )}
             </button>
 
-            {activeConversation?.messages.length ? (
-              <span className="text-base sm:text-lg font-display tracking-tight text-foreground truncate">
-                {activeConversation.title}
+            <div className="flex items-center gap-2.5 min-w-0">
+              <span className="font-display font-bold tracking-tight text-xl text-foreground">
+                Vellum
               </span>
-            ) : (
-              <div className="flex items-baseline gap-1.5">
-                <span className="font-display tracking-tight text-2xl text-foreground">
-                  Vellum
+              {activeConversation?.messages.length > 0 && (
+                <span className="text-xs font-mono text-muted-foreground truncate max-w-[240px]">
+                  · {activeConversation.title}
                 </span>
-                <span className="text-muted-foreground font-mono text-[10px]">TM</span>
-              </div>
-            )}
-          </div>
-
-          {/* Zone 2: Optimus Contextual Controls + Light/Dark Switch + Primary Capsule CTA */}
-          <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-            <button
-              type="button"
-              onClick={() => openKeyModelsModal(hasActiveConnection ? 'models' : 'keys')}
-              className="min-h-[40px] px-2.5 sm:px-4 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-semibold text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 tabular-nums"
-            >
-              {hasActiveConnection ? (
-                <>
-                  <SlidersHorizontal className="w-3.5 h-3.5 shrink-0" />
-                  <span className="hidden sm:inline">Models ({models.length})</span>
-                  <span className="sm:hidden">{models.length}</span>
-                </>
-              ) : (
-                <>
-                  <KeyRound className="w-3.5 h-3.5 shrink-0" />
-                  <span>Base API</span>
-                </>
               )}
-            </button>
-
-            {isGuestMode ? (
-              <button
-                type="button"
-                onClick={() => openKeyModelsModal('shares')}
-                className="min-h-[40px] px-3 sm:px-3.5 rounded-full border border-foreground/20 hover:bg-foreground/5 text-xs font-mono font-semibold text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
-              >
-                <Link2 className="w-3.5 h-3.5 shrink-0" />
-                <span>Pass</span>
-              </button>
-            ) : activeKeyObj ? (
-              <button
-                type="button"
-                onClick={() => openKeyModelsModal('shares', activeKeyObj.id)}
-                title="Create or manage disguised key links"
-                className="min-h-[40px] px-3 sm:px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-semibold text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 tabular-nums"
-              >
-                <Link2 className="w-3.5 h-3.5 shrink-0" />
-                <span>
-                  Share{sharedLinks.length > 0 ? ` (${sharedLinks.length})` : ''}
-                </span>
-              </button>
-            ) : null}
-
-            {allConversationArtifacts.length > 0 && (
-              <button
-                type="button"
-                onClick={() =>
-                  setActiveArtifact((curr) =>
-                    curr ? null : allConversationArtifacts[allConversationArtifacts.length - 1]
-                  )
-                }
-                className="min-h-[40px] px-2.5 sm:px-4 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-semibold text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
-              >
-                <Layers className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">
-                  Canvas ({allConversationArtifacts.length})
-                </span>
-              </button>
-            )}
-
-            <button
-              type="button"
-              onClick={handleToggleStickyScroll}
-              aria-pressed={stickyScroll}
-              aria-label={
-                stickyScroll
-                  ? 'Sticky Scroll is on. Tap to disable auto-scrolling.'
-                  : 'Sticky Scroll is off. Tap to enable auto-scrolling.'
-              }
-              title={
-                stickyScroll
-                  ? 'Sticky Scroll: On — auto-scrolls with replies'
-                  : 'Sticky Scroll: Off — stays put while reading'
-              }
-              className={`hidden sm:flex min-h-[40px] min-w-[40px] md:px-3.5 rounded-full border text-xs font-mono font-medium items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0 ${
-                stickyScroll
-                  ? 'border-foreground/30 bg-foreground/[0.07] text-foreground'
-                  : 'border-foreground/15 text-muted-foreground hover:text-foreground hover:bg-foreground/5'
-              }`}
-            >
-              <ArrowDownToLine className="w-3.5 h-3.5 shrink-0" />
-              <span className="hidden md:inline">
-                Sticky {stickyScroll ? 'On' : 'Off'}
-              </span>
-            </button>
-
-            {!isAppInstalled && (
-              <button
-                type="button"
-                onClick={handleInstallClick}
-                aria-label="Install Vellum app"
-                title="Install Vellum app"
-                className="hidden md:flex min-h-[40px] min-w-[40px] lg:px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-medium text-foreground items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
-              >
-                <Download className="w-3.5 h-3.5 shrink-0" />
-                <span className="hidden lg:inline">Install</span>
-              </button>
-            )}
-
-            <button
-              type="button"
-              onClick={() => setDarkMode((d) => !d)}
-              aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-              title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-              className="min-h-[40px] min-w-[40px] rounded-full border border-foreground/15 hover:bg-foreground/5 flex items-center justify-center text-foreground transition-colors shrink-0"
-            >
-              {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
-            </button>
-
-            <button
-              type="button"
-              onClick={handleNewChat}
-              aria-label="Start new chat"
-              className="min-h-[40px] min-w-[40px] px-3 sm:px-5 rounded-full bg-foreground hover:bg-foreground/90 text-background text-xs font-semibold flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">New chat</span>
-            </button>
+            </div>
           </div>
         </header>
 

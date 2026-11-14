@@ -3,47 +3,47 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 :root {
-  --background: #fafaf9;
-  --foreground: #080503;
-  --card: #ffffff;
-  --card-foreground: #080503;
-  --popover: #ffffff;
-  --popover-foreground: #080503;
-  --primary: #080503;
-  --primary-foreground: #fafaf9;
-  --secondary: #f3f2ee;
-  --secondary-foreground: #080503;
-  --muted: #ecebe7;
-  --muted-foreground: #5e534a;
-  --accent: #e7e4dd;
-  --accent-foreground: #080503;
-  --destructive: #e40014;
-  --destructive-foreground: #fafaf9;
-  --border: #dad7d0;
-  --input: #e7e4dd;
-  --ring: #080503;
+  --background: #f7f6f0;
+  --foreground: #292524;
+  --card: #fbfaf6;
+  --card-foreground: #292524;
+  --popover: #fbfaf6;
+  --popover-foreground: #292524;
+  --primary: #292524;
+  --primary-foreground: #f7f6f0;
+  --secondary: #ede8dc;
+  --secondary-foreground: #292524;
+  --muted: #e4ded0;
+  --muted-foreground: #78716c;
+  --accent: #ded7cc;
+  --accent-foreground: #292524;
+  --destructive: #b9380a;
+  --destructive-foreground: #f7f6f0;
+  --border: #ded7cc;
+  --input: #ded7cc;
+  --ring: #292524;
 }
 
 .dark {
-  --background: #080503;
-  --foreground: #fafaf9;
-  --card: #110d0a;
-  --card-foreground: #fafaf9;
-  --popover: #110d0a;
-  --popover-foreground: #fafaf9;
-  --primary: #fafaf9;
-  --primary-foreground: #080503;
-  --secondary: #16120e;
-  --secondary-foreground: #fafaf9;
-  --muted: #1f1a15;
-  --muted-foreground: #a89c92;
-  --accent: #26201a;
-  --accent-foreground: #fafaf9;
-  --destructive: #ff6568;
-  --destructive-foreground: #080503;
-  --border: #2a231d;
-  --input: #26201a;
-  --ring: #fafaf9;
+  --background: #121110;
+  --foreground: #e7e5e4;
+  --card: #1c1b19;
+  --card-foreground: #e7e5e4;
+  --popover: #1c1b19;
+  --popover-foreground: #e7e5e4;
+  --primary: #e7e5e4;
+  --primary-foreground: #121110;
+  --secondary: #262421;
+  --secondary-foreground: #e7e5e4;
+  --muted: #302e2a;
+  --muted-foreground: #a8a29e;
+  --accent: #3a3733;
+  --accent-foreground: #e7e5e4;
+  --destructive: #f97316;
+  --destructive-foreground: #121110;
+  --border: #2c2a27;
+  --input: #3a3733;
+  --ring: #e7e5e4;
 }
 
 @theme inline {

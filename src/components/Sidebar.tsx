@@ -618,61 +618,60 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </span>
           </button>
 
-          {!isGuestMode && activeKey && (
-            <button
-              type="button"
-              onClick={() => {
-                onOpenKeyManager('shares');
-                if (window.innerWidth < 1024) onClose();
-              }}
-              className="w-full min-h-[44px] px-3.5 rounded-2xl border border-foreground/15 hover:bg-foreground/[0.04] flex items-center justify-between gap-3 transition-colors text-left"
-            >
-              <span className="flex items-center gap-2.5 min-w-0">
-                <Link2 className="w-4 h-4 shrink-0 text-muted-foreground" />
-                <span className="min-w-0">
-                  <span className="block text-xs font-bold tracking-tight text-foreground">
-                    Disguised Share Links {sharedLinksCount > 0 ? `(${sharedLinksCount})` : ''}
-                  </span>
-                  <span className="block text-[11px] text-muted-foreground truncate">
-                    Share access without showing your key
-                  </span>
+
+          <button
+            type="button"
+            onClick={() => {
+              onOpenKeyManager('shares');
+              if (window.innerWidth < 1024) onClose();
+            }}
+            className="w-full min-h-[44px] px-3.5 rounded-2xl border border-foreground/15 hover:bg-foreground/[0.04] flex items-center justify-between gap-3 transition-colors text-left"
+          >
+            <span className="flex items-center gap-2.5 min-w-0">
+              <Link2 className="w-4 h-4 shrink-0 text-muted-foreground" />
+              <span className="min-w-0">
+                <span className="block text-xs font-bold tracking-tight text-foreground">
+                  Sharing Vault
+                </span>
+                <span className="block text-[11px] text-muted-foreground truncate">
+                  Manage disguised share links
                 </span>
               </span>
-              <ArrowUpRight className="w-4 h-4 shrink-0 text-muted-foreground" />
-            </button>
-          )}
+            </span>
+            <ArrowUpRight className="w-4 h-4 shrink-0 text-muted-foreground" />
+          </button>
 
-          <div className="flex items-center justify-between gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                onOpenKeyManager(isGuestMode ? 'shares' : 'keys');
-                if (window.innerWidth < 1024) onClose();
-              }}
-              className="min-h-[44px] px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-bold text-foreground flex items-center gap-2 transition-colors min-w-0 flex-1"
-            >
-              {isGuestMode ? (
-                <Link2 className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
-              ) : (
-                <KeyRound className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
-              )}
-              <span className="truncate">
-                {isGuestMode
-                  ? guestSharePass?.label || 'Shared Pass'
-                  : activeKey
-                    ? activeKey.label
-                    : 'Set Base API & Key'}
+          <button
+            type="button"
+            onClick={() => {
+              onOpenKeyManager('models');
+              if (window.innerWidth < 1024) onClose();
+            }}
+            className="w-full min-h-[44px] px-3.5 rounded-2xl border border-foreground/15 hover:bg-foreground/[0.04] flex items-center justify-between gap-3 transition-colors text-left"
+          >
+            <span className="flex items-center gap-2.5 min-w-0">
+              <KeyRound className="w-4 h-4 shrink-0 text-muted-foreground" />
+              <span className="min-w-0">
+                <span className="block text-xs font-bold tracking-tight text-foreground">
+                  API Keys & Models
+                </span>
+                <span className="block text-[11px] text-muted-foreground truncate">
+                  Configure gateways and test models
+                </span>
               </span>
-            </button>
+            </span>
+            <ArrowUpRight className="w-4 h-4 shrink-0 text-muted-foreground" />
+          </button>
 
+          <div className="flex items-center justify-between gap-2 pt-1">
             <button
               type="button"
               onClick={onToggleDarkMode}
               aria-label="Toggle light and dark mode"
-              className="min-h-[44px] px-3.5 rounded-full border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-semibold text-foreground flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
+              className="w-full min-h-[44px] px-3.5 rounded-2xl border border-foreground/15 hover:bg-foreground/5 text-xs font-mono font-semibold text-foreground flex items-center justify-center gap-2 transition-colors"
             >
-              {darkMode ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
-              <span>{darkMode ? 'Light' : 'Dark'}</span>
+              {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+              <span>{darkMode ? 'Light Theme' : 'Dark Theme'}</span>
             </button>
           </div>
         </div>
